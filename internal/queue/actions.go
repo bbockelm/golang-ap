@@ -52,6 +52,12 @@ type ActionRequest struct {
 	Reason         string
 	HoldReasonCode int
 	HoldReasonSub  int
+	// System marks an action initiated by the schedd itself (a periodic /
+	// on-exit policy firing) rather than by a user tool. It bypasses the
+	// per-user owner permission check, matching the C++ schedd's holdJob /
+	// abortJob / releaseJob running with schedd authority when a policy
+	// expression fires.
+	System bool
 }
 
 // CheckAction validates an action against job c.p without mutating anything and
@@ -78,7 +84,7 @@ func (q *Queue) actOnJob(c, p int, req ActionRequest, apply bool) int {
 		return ArNotFound
 	}
 	owner, _ := ad.EvaluateAttrString("Owner")
-	if !q.IsSuperUser(req.Actor) && shortName(req.Actor) != owner {
+	if !req.System && !q.IsSuperUser(req.Actor) && shortName(req.Actor) != owner {
 		return ArPermissionDenied
 	}
 	st, _ := ad.EvaluateAttrInt("JobStatus")

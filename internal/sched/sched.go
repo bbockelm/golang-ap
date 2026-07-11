@@ -51,9 +51,10 @@ import (
 
 	"github.com/bbockelm/golang-ap/internal/match"
 	"github.com/bbockelm/golang-ap/internal/negotiate"
+	"github.com/bbockelm/golang-ap/internal/policy"
 	"github.com/bbockelm/golang-ap/internal/queue"
-	"github.com/bbockelm/golang-ap/shadow"
 	"github.com/bbockelm/golang-ap/internal/userlog"
+	"github.com/bbockelm/golang-ap/shadow"
 )
 
 // holdCodeShadowException is CONDOR_HOLD_CODE::ShadowException
@@ -82,6 +83,11 @@ const advertiseTimeout = 30 * time.Second
 // (submit_utils.cpp / param_info.in). A restarted schedd reconnects to a job
 // only while (now - LastJobLeaseRenewal) < JobLeaseDuration.
 const DefaultJobLeaseDuration = 2400
+
+// DefaultPeriodicInterval is how often the periodic-policy evaluator scans the
+// queue (config knob PERIODIC_EXPR_INTERVAL), matching the C++ schedd's
+// param_integer("PERIODIC_EXPR_INTERVAL", 60).
+const DefaultPeriodicInterval = 60 * time.Second
 
 // Event is a unit of work delivered to the scheduler's event loop.
 type Event interface{ isEvent() }
@@ -146,6 +152,14 @@ type Options struct {
 	// sandbox file ops run as the job Owner. nil lets the shadow default to the
 	// process-wide native Privsep (run as the current user).
 	Privsep droppriv.Privsep
+
+	// PeriodicInterval is how often the periodic-policy evaluator scans the queue
+	// (PERIODIC_EXPR_INTERVAL). <=0 means DefaultPeriodicInterval.
+	PeriodicInterval time.Duration
+	// SysPolicy carries the SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON /
+	// _SUBCODE) expressions applied to every job in addition to its own
+	// Periodic* expressions. nil (the default) means no system policy.
+	SysPolicy *policy.System
 }
 
 // jobKey identifies a job proc.
@@ -202,6 +216,9 @@ type Scheduler struct {
 	userlog           *userlog.Manager
 	privsep           droppriv.Privsep
 
+	periodicInterval time.Duration
+	sysPolicy        *policy.System
+
 	events chan Event
 	// advertiseNudge asks the (separate) advertiser goroutine to push ads now,
 	// e.g. on RESCHEDULE. Buffered depth 1 so a pending nudge coalesces requests
@@ -212,6 +229,11 @@ type Scheduler struct {
 	running   map[jobKey]*runInfo
 	draining  bool
 	drainDone chan struct{}
+	// policyPending dedupes in-flight periodic-policy actions: a job is added
+	// when the core dispatches its (off-core) hold/release/remove and removed on
+	// the evPolicyDone that the apply goroutine posts back, so a job firing on
+	// consecutive ticks before its action lands is not acted on twice.
+	policyPending map[jobKey]bool
 
 	// Panic test hook (accessed from shadow goroutines; mutex-guarded).
 	panicMu    sync.Mutex
@@ -245,18 +267,22 @@ func New(opts Options) *Scheduler {
 	if jobLease <= 0 {
 		jobLease = DefaultJobLeaseDuration
 	}
+	periodic := opts.PeriodicInterval
+	if periodic <= 0 {
+		periodic = DefaultPeriodicInterval
+	}
 	s := &Scheduler{
-		log:           opts.Logger,
-		interval:      interval,
-		advertise:     opts.Advertise,
-		q:             opts.Queue,
-		matches:       opts.Matches,
-		endpoint:      opts.Endpoint,
-		scheddName:    opts.ScheddName,
-		scheddAddr:    opts.ScheddAddr,
-		uidDomain:     opts.UIDDomain,
-		shadowVersion: opts.ShadowVersion,
-		aliveInterval: alive,
+		log:               opts.Logger,
+		interval:          interval,
+		advertise:         opts.Advertise,
+		q:                 opts.Queue,
+		matches:           opts.Matches,
+		endpoint:          opts.Endpoint,
+		scheddName:        opts.ScheddName,
+		scheddAddr:        opts.ScheddAddr,
+		uidDomain:         opts.UIDDomain,
+		shadowVersion:     opts.ShadowVersion,
+		aliveInterval:     alive,
 		sweepInterval:     opts.SweepInterval,
 		maxExceptions:     maxExc,
 		drainGrace:        grace,
@@ -264,9 +290,12 @@ func New(opts Options) *Scheduler {
 		defaultJobLease:   jobLease,
 		userlog:           opts.UserLog,
 		privsep:           opts.Privsep,
+		periodicInterval:  periodic,
+		sysPolicy:         opts.SysPolicy,
 		events:            make(chan Event, 256),
 		advertiseNudge:    make(chan struct{}, 1),
 		running:           map[jobKey]*runInfo{},
+		policyPending:     map[jobKey]bool{},
 	}
 	if opts.PanicJob != "" {
 		var c, p int
@@ -294,9 +323,10 @@ func (s *Scheduler) Submit(ev Event) {
 // stall job-state processing.
 func (s *Scheduler) Start(ctx context.Context) {
 	ctx, s.cancel = context.WithCancel(ctx)
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.loop(ctx)
 	go s.advertiseLoop(ctx)
+	go s.periodicLoop(ctx)
 }
 
 // Stop gracefully shuts the core down: it drains (stops accepting matches,
@@ -426,6 +456,29 @@ type evRecover struct {
 	done chan struct{}
 }
 
+// The periodic-policy evaluator (off the core) submits one of these when a
+// PeriodicRemove/Hold/Release expression (per-job or SYSTEM_PERIODIC_*) fires
+// for a job. The core re-validates the job's status and applies the action via
+// the SAME path condor_rm/condor_hold/condor_release use (queue.ApplyAction),
+// which for a RUNNING job first tears down the shadow through the vacate hook.
+type evPolicyRemove struct {
+	c, p   int
+	reason string
+}
+type evPolicyHold struct {
+	c, p      int
+	reason    string
+	code, sub int
+}
+type evPolicyRelease struct {
+	c, p   int
+	reason string
+}
+
+// evPolicyDone clears a job from the in-flight policy set once its (off-core)
+// action goroutine has finished applying.
+type evPolicyDone struct{ key jobKey }
+
 func (evMatch) isEvent()           {}
 func (evStarted) isEvent()         {}
 func (evExited) isEvent()          {}
@@ -435,6 +488,10 @@ func (evTeardown) isEvent()        {}
 func (evDrain) isEvent()           {}
 func (evReconnectFailed) isEvent() {}
 func (evRecover) isEvent()         {}
+func (evPolicyRemove) isEvent()    {}
+func (evPolicyHold) isEvent()      {}
+func (evPolicyRelease) isEvent()   {}
+func (evPolicyDone) isEvent()      {}
 
 // --- event loop -------------------------------------------------------------
 
@@ -533,6 +590,18 @@ func (s *Scheduler) handle(ctx context.Context, ev Event) {
 		s.handleReconnectFailed(e)
 	case evRecover:
 		s.handleRecover(ctx, e)
+	case evPolicyRemove:
+		s.handlePolicyAction(e.c, e.p, queue.ActionRequest{
+			Kind: queue.ActRemove, Actor: policyActor, System: true, Reason: e.reason})
+	case evPolicyHold:
+		s.handlePolicyAction(e.c, e.p, queue.ActionRequest{
+			Kind: queue.ActHold, Actor: policyActor, System: true, Reason: e.reason,
+			HoldReasonCode: e.code, HoldReasonSub: e.sub})
+	case evPolicyRelease:
+		s.handlePolicyAction(e.c, e.p, queue.ActionRequest{
+			Kind: queue.ActRelease, Actor: policyActor, System: true, Reason: e.reason})
+	case evPolicyDone:
+		delete(s.policyPending, e.key)
 	default:
 		s.log.Debug(logging.DestinationGeneral, "scheduler received unknown event")
 	}
@@ -850,33 +919,129 @@ func (s *Scheduler) handleExited(e evExited) {
 		} else if sig, ok := res.TermSignal(); ok {
 			_ = ad.Set("ExitBySignal", true)
 			_ = ad.Set("ExitSignal", int64(sig))
+		} else {
+			// UserPolicy requires OnExitBySignal to be present to evaluate the
+			// on-exit expressions; default to a clean (non-signal, code 0) exit.
+			_ = ad.Set("ExitBySignal", false)
+			_ = ad.Set("ExitCode", int64(0))
+			_ = ad.Set("ExitStatus", int64(0))
 		}
 		if start, ok := ad.EvaluateAttrInt("JobCurrentStartDate"); ok && start > 0 {
 			prev, _ := ad.EvaluateAttrInt("RemoteWallClockTime")
 			_ = ad.Set("RemoteWallClockTime", prev+(now-start))
 		}
+		// NumJobCompletions counts each execution that ran to completion (like the
+		// C++ schedd), whether the job then terminates, is held on exit, or is
+		// requeued -- so on_exit_remove expressions can gate on the run count.
+		completions, _ := ad.EvaluateAttrInt("NumJobCompletions")
+		_ = ad.Set("NumJobCompletions", completions+1)
 		_ = ad.Set("LastJobStatus", int64(queue.StatusRunning))
 	})
-	// JOB_TERMINATED user-log event (like the C++ shadow's logTerminateEvent),
-	// before Complete archives the job out of the live queue. Read the flattened
-	// ad so UserLog/Iwd resolve.
-	if s.userlog != nil {
-		if ad, ok := s.q.Get(e.c, e.p); ok {
-			if code, ok := res.ExitCode(); ok {
-				s.userlog.Terminated(ad, false, code)
-			} else if sig, ok := res.TermSignal(); ok {
-				s.userlog.Terminated(ad, true, sig)
-			} else {
-				s.userlog.Terminated(ad, false, 0)
+
+	// On-exit user policy (OnExitHold / OnExitRemove, plus any Periodic* that
+	// fires at exit): decide whether the job terminates, is held, is requeued for
+	// re-run, or is removed. Evaluate against a private copy of the just-updated
+	// ad with CurrentTime bound to now; the job is still JobStatus=Running here.
+	d := policy.Decision{Action: policy.Complete}
+	if ad, ok := s.q.Get(e.c, e.p); ok {
+		_ = ad.Set("CurrentTime", now)
+		d = policy.Analyze(ad, policy.PeriodicThenExit, s.sysPolicy, queue.StatusRunning)
+	}
+	code, _ := res.ExitCode()
+
+	switch d.Action {
+	case policy.Hold:
+		// OnExitHold (or a Periodic* hold) fired: hold the job in place; do NOT
+		// archive it. HoldReasonCode is JobPolicy(3)/SystemPolicy(26) per policy.
+		s.holdOnExit(e.c, e.p, d, now)
+		s.log.Info(logging.DestinationGeneral, "job held on exit by policy",
+			"job", key.String(), "exit_code", code, "firing", d.Firing, "hold_code", d.HoldCode)
+
+	case policy.Requeue:
+		// OnExitRemove evaluated false: return the job to Idle for re-run (the
+		// substrate max_retries builds on). NOT counted as a shadow failure.
+		s.requeueOnExit(e.c, e.p, now, d.Reason)
+		s.log.Info(logging.DestinationGeneral, "job requeued on exit by policy (OnExitRemove=false)",
+			"job", key.String(), "exit_code", code)
+
+	case policy.Remove:
+		// A Periodic*/exit remove fired: archive the job as Removed (status 3)
+		// via the same off-core ApplyAction path condor_rm uses (the shadow is
+		// already gone, so its teardown hook is a no-op).
+		s.Submit(evPolicyRemove{e.c, e.p, d.Reason})
+		s.log.Info(logging.DestinationGeneral, "job removed on exit by policy",
+			"job", key.String(), "exit_code", code, "firing", d.Firing)
+
+	default: // policy.Complete
+		// Normal termination (OnExitRemove true / default): JOB_TERMINATED
+		// user-log event, then move to Completed (JobStatus=4 + CompletionDate)
+		// and archive out of the live queue.
+		if s.userlog != nil {
+			if ad, ok := s.q.Get(e.c, e.p); ok {
+				if c2, ok := res.ExitCode(); ok {
+					s.userlog.Terminated(ad, false, c2)
+				} else if sig, ok := res.TermSignal(); ok {
+					s.userlog.Terminated(ad, true, sig)
+				} else {
+					s.userlog.Terminated(ad, false, 0)
+				}
 			}
 		}
+		s.q.Complete(e.c, e.p)
+		s.log.Info(logging.DestinationGeneral, "job completed",
+			"job", key.String(), "exit_code", code, "reason", res.Reason)
 	}
-	// Move to Completed (JobStatus=4 + CompletionDate) and archive out of the
-	// live queue.
-	s.q.Complete(e.c, e.p)
-	code, _ := res.ExitCode()
-	s.log.Info(logging.DestinationGeneral, "job completed",
-		"job", key.String(), "exit_code", code, "reason", res.Reason)
+}
+
+// holdOnExit holds a just-exited job in place (OnExitHold or a Periodic* hold
+// firing at exit). Runs on the core goroutine: the shadow is already reaped, so
+// no teardown is needed and we write the Held state directly (via q.Modify),
+// using the non-blocking HeldCore user-log path so a hung log FS cannot freeze
+// the core.
+func (s *Scheduler) holdOnExit(c, p int, d policy.Decision, now int64) {
+	reason := d.Reason
+	if reason == "" {
+		reason = "Job held by policy on exit"
+	}
+	code := d.HoldCode
+	if code == 0 {
+		code = policy.HoldCodeJobPolicy
+	}
+	s.q.Modify(c, p, func(ad *classad.ClassAd) {
+		_ = ad.Set("LastJobStatus", int64(queue.StatusRunning))
+		_ = ad.Set("JobStatus", int64(queue.StatusHeld))
+		_ = ad.Set("EnteredCurrentStatus", now)
+		_ = ad.Set("HoldReason", reason)
+		_ = ad.Set("HoldReasonCode", int64(code))
+		_ = ad.Set("HoldReasonSubCode", int64(d.HoldSubCode))
+		numHolds, _ := ad.EvaluateAttrInt("NumHolds")
+		_ = ad.Set("NumHolds", numHolds+1)
+	})
+	if s.userlog != nil {
+		if ad, ok := s.q.Get(c, p); ok {
+			s.userlog.HeldCore(ad, reason, code, d.HoldSubCode)
+		}
+	}
+}
+
+// requeueOnExit returns a just-exited job to Idle for re-run (OnExitRemove
+// evaluated false). Runs on the core goroutine (shadow already reaped). Writes a
+// JOB_EVICTED (terminate-and-requeued) user-log event, matching the C++ shadow's
+// logRequeueEvent.
+func (s *Scheduler) requeueOnExit(c, p int, now int64, reason string) {
+	s.q.Modify(c, p, func(ad *classad.ClassAd) {
+		_ = ad.Set("LastJobStatus", int64(queue.StatusRunning))
+		_ = ad.Set("JobStatus", int64(queue.StatusIdle))
+		_ = ad.Set("EnteredCurrentStatus", now)
+	})
+	if s.userlog != nil {
+		if ad, ok := s.q.Get(c, p); ok {
+			if reason == "" {
+				reason = "Job requeued (OnExitRemove is false)"
+			}
+			s.userlog.Evicted(ad, reason)
+		}
+	}
 }
 
 // handleFailed reaps a run that failed before (or instead of) producing a
@@ -1284,6 +1449,134 @@ func (s *Scheduler) handleReconnectFailed(e evReconnectFailed) {
 	}
 	// count=false: a reconnect failure is not a shadow exception.
 	s.jobFailed(e.c, e.p, "reconnect failed: "+errStr(e.err), false)
+}
+
+// --- periodic policy engine -------------------------------------------------
+
+// policyActor labels a queue action the schedd itself initiates from a policy
+// firing (System actions bypass the per-user owner check; the label only feeds
+// default reason strings / user-log fields).
+const policyActor = "condor_schedd"
+
+// periodicLoop is the periodic-policy evaluator, run OFF the core goroutine (to
+// honor the core-responsiveness rule) on a PERIODIC_EXPR_INTERVAL ticker. Each
+// tick it snapshot-scans the live queue and, for every job whose PeriodicRemove/
+// Hold/Release (per-job or SYSTEM_PERIODIC_*) fires, submits an action event to
+// the core. It never mutates queue or registry state itself. Mirrors the C++
+// Scheduler::PeriodicExprHandler / WalkJobQueue(PeriodicExprEval).
+func (s *Scheduler) periodicLoop(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(s.periodicInterval)
+	defer ticker.Stop()
+	s.log.Info(logging.DestinationGeneral, "periodic-policy evaluator started",
+		"interval", s.periodicInterval.String())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.evaluatePeriodic()
+		}
+	}
+}
+
+// evaluatePeriodic scans the live queue once and dispatches a policy action for
+// each firing job. It runs on the evaluator goroutine and touches only the
+// concurrency-safe queue snapshot (Scan) and Submit.
+//
+// Scale: this is O(live jobs) every interval. That is fine for now, but a large
+// queue would want an ordered index of the soonest-firing time-based expressions
+// or a dirty-set of jobs whose inputs changed, so we do not re-evaluate every
+// job every tick. Not prematurely optimized here (see ROADMAP scale note).
+func (s *Scheduler) evaluatePeriodic() {
+	now := time.Now().Unix()
+	haveSys := !s.sysPolicy.Empty()
+	for shared := range s.q.Scan() {
+		// Only Idle/Running/Held jobs live in the queue (terminal jobs are
+		// archived out); skip anything without a candidate expression fast.
+		st, _ := shared.EvaluateAttrInt("JobStatus")
+		state := int(st)
+		if !haveSys && !hasPeriodicExpr(shared, state) {
+			continue
+		}
+		// Evaluate against a private copy with CurrentTime bound to now, so an
+		// expression referencing CurrentTime resolves and we never mutate the
+		// shared snapshot ad (Scan yields ads shared with the store).
+		ad := copyAd(shared)
+		_ = ad.Set("CurrentTime", now)
+		c, _ := ad.EvaluateAttrInt("ClusterId")
+		p, _ := ad.EvaluateAttrInt("ProcId")
+		d := policy.Analyze(ad, policy.PeriodicOnly, s.sysPolicy, state)
+		switch d.Action {
+		case policy.Remove:
+			s.Submit(evPolicyRemove{int(c), int(p), d.Reason})
+		case policy.Hold:
+			s.Submit(evPolicyHold{int(c), int(p), d.Reason, d.HoldCode, d.HoldSubCode})
+		case policy.Release:
+			s.Submit(evPolicyRelease{int(c), int(p), d.Reason})
+		}
+	}
+}
+
+// hasPeriodicExpr reports whether a job carries any periodic expression relevant
+// to its state, so the evaluator can skip the copy+eval of jobs that have none
+// (the overwhelming common case). PeriodicRelease matters only for Held jobs.
+func hasPeriodicExpr(ad *classad.ClassAd, state int) bool {
+	if _, ok := ad.Lookup("PeriodicRemove"); ok {
+		return true
+	}
+	if _, ok := ad.Lookup("PeriodicHold"); ok {
+		return true
+	}
+	if state == queue.StatusHeld {
+		if _, ok := ad.Lookup("PeriodicRelease"); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// handlePolicyAction applies a periodic-policy firing on the core goroutine. It
+// re-validates the job's CURRENT status (the evaluator saw a snapshot that may
+// be stale) and, for an applicable action, hands the queue mutation to an
+// off-core goroutine calling queue.ApplyAction -- the SAME entry point
+// condor_rm/condor_hold/condor_release use. For a RUNNING job ApplyAction
+// invokes the onVacateRunning hook (TeardownJobAndWait), which submits an
+// evTeardown the core must process; running it inline here would DEADLOCK the
+// core (the core cannot both block on and service that event), so it must be
+// off-core. The core-owned policyPending set dedupes a job that fires on
+// consecutive ticks before its action lands.
+func (s *Scheduler) handlePolicyAction(c, p int, req queue.ActionRequest) {
+	key := jobKey{c, p}
+	if s.policyPending[key] {
+		return
+	}
+	status := s.q.JobStatus(c, p)
+	if !policyApplicable(req.Kind, status) {
+		return
+	}
+	s.policyPending[key] = true
+	s.log.Info(logging.DestinationGeneral, "applying periodic policy action",
+		"job", key.String(), "action", int(req.Kind), "reason", req.Reason)
+	go func() {
+		s.q.ApplyAction(c, p, req)
+		s.Submit(evPolicyDone{key})
+	}()
+}
+
+// policyApplicable reports whether a policy action still applies to a job in the
+// given current status (mirrors PeriodicExprEval's status guards: don't re-remove
+// a Removed job, don't re-hold a Held/terminal job, only release a Held job).
+func policyApplicable(kind queue.ActionKind, status int) bool {
+	switch kind {
+	case queue.ActRemove:
+		return status != 0 && status != queue.StatusRemoved
+	case queue.ActHold:
+		return status == queue.StatusIdle || status == queue.StatusRunning
+	case queue.ActRelease:
+		return status == queue.StatusHeld
+	}
+	return false
 }
 
 // copyAd returns a shallow attribute-by-attribute copy of ad, safe to hand to a

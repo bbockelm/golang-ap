@@ -33,6 +33,7 @@ import (
 	"github.com/bbockelm/golang-ap/internal/advertise"
 	"github.com/bbockelm/golang-ap/internal/match"
 	"github.com/bbockelm/golang-ap/internal/negotiate"
+	"github.com/bbockelm/golang-ap/internal/policy"
 	"github.com/bbockelm/golang-ap/internal/queue"
 	"github.com/bbockelm/golang-ap/internal/sched"
 	"github.com/bbockelm/golang-ap/internal/spool"
@@ -253,7 +254,7 @@ func run() error {
 		// How often the core sweeps claim leases (renewing live runs, reaping dead
 		// matches). Configurable so tests can exercise several sweep ticks over a
 		// short job instead of a long one; defaults to 30s.
-		SweepInterval:     configSeconds(cfg, "SCHEDD_LEASE_SWEEP_INTERVAL", 30*time.Second),
+		SweepInterval: configSeconds(cfg, "SCHEDD_LEASE_SWEEP_INTERVAL", 30*time.Second),
 		// How many shadow failures a job may accumulate before it is held with
 		// HoldReasonCode 1002 (ShadowException) instead of requeued.
 		MaxShadowExceptions: configInt(cfg, "MAX_SHADOW_EXCEPTIONS", sched.DefaultMaxShadowExceptions),
@@ -268,6 +269,11 @@ func run() error {
 		DefaultJobLease:   configInt(cfg, "JOB_DEFAULT_LEASE_DURATION", sched.DefaultJobLeaseDuration),
 		UserLog:           ulogMgr,
 		Privsep:           privsep,
+		// Periodic + on-exit user job policy: the evaluator ticks every
+		// PERIODIC_EXPR_INTERVAL and applies each job's Periodic*/OnExit*
+		// expressions plus the pool-wide SYSTEM_PERIODIC_* expressions.
+		PeriodicInterval: configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval),
+		SysPolicy:        buildSysPolicy(cfg),
 	})
 
 	// NEGOTIATE (416): the negotiator's matchmaking. Registered at NEGOTIATOR (and
@@ -498,6 +504,27 @@ func buildPrivsep(cfg *config.Config, log *logging.Logger) (droppriv.Privsep, er
 		"force_unprivileged", cfgPS.ForceHelperUnprivileged,
 		"euid", os.Geteuid())
 	return ps, nil
+}
+
+// buildSysPolicy reads the SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON /
+// _SUBCODE) configuration into a policy.System applied to every job. Returns nil
+// when none are set (the common case), which the evaluator treats as no system
+// policy.
+func buildSysPolicy(cfg *config.Config) *policy.System {
+	get := func(key string) string {
+		if v, ok := cfg.Get(key); ok {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	}
+	return policy.NewSystem(policy.SystemConfig{
+		HoldExpr:     get("SYSTEM_PERIODIC_HOLD"),
+		HoldReason:   get("SYSTEM_PERIODIC_HOLD_REASON"),
+		HoldSubCode:  get("SYSTEM_PERIODIC_HOLD_SUBCODE"),
+		ReleaseExpr:  get("SYSTEM_PERIODIC_RELEASE"),
+		RemoveExpr:   get("SYSTEM_PERIODIC_REMOVE"),
+		RemoveReason: get("SYSTEM_PERIODIC_REMOVE_REASON"),
+	})
 }
 
 func configSeconds(cfg *config.Config, key string, def time.Duration) time.Duration {
