@@ -1,0 +1,10 @@
+# Compiled binaries
+/schedd
+/golang-ap-schedd
+cmd/schedd/schedd
+*.exe
+*.test
+
+# Editor / OS cruft
+.DS_Store
+*.swp
