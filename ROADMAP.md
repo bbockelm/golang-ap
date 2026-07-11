@@ -1,90 +1,94 @@
 # golang-ap roadmap
 
-Post-MVP work items, most load-bearing first.
+Open, post-MVP work items — most load-bearing first. Shipped features (runs
+under condor_master; claims/activates real startd slots; stock
+submit/q/hold/rm; negotiation with RRL batching; reconnect across restart;
+`-spool`; async off-core user-log writes with backpressure; supervision/chaos)
+are in `git log`, not here.
 
-## 1. Decouple user-log writes from the scheduler core (+ make them durable)
+## 1. Privilege separation — running work as separate Unix users
 
-**Status: steps 1 & 2 DONE** (async off-core writes + backpressure, in
-`internal/userlog`). Step 3 (durable/recoverable intents) remains future work;
-it is safely deferrable because everything that watches the user log (DAGMan,
-condor_wait) reconciles from the queue DB, which is the source of truth — so a
-dropped/degraded user-log event under extreme FS congestion loses observability,
-never job state.
+**Where we are.** The schedd is effectively single-uid. `UID_DOMAIN` is only a
+string suffix that forms the `User` attribute; `Owner`/`User` is enforced as
+*authorization*, never mapped to a Unix uid. Spool sandboxes and transferred
+files are written with plain `os.OpenFile` as the one schedd process uid, so in
+a shared pool every user's job data is owned by the condor account — a
+cross-user exposure problem. In-process goroutine-shadows can't each hold a uid
+(a process has one euid), so per-shadow user switching needs help.
 
-**Why.** User job logs (`log = ...`) routinely live on slow, flaky shared
-filesystems (NFS or worse), while the queue database sits on fast local disk.
-This asymmetry is a well-known source of schedd lockups in production HTCondor:
-a stalled log write on a bad mount freezes the daemon. We already hit the same
-failure *class* once (an unbounded collector-advertise dial blocking the core;
-fixed) — user-log writes are the remaining instance, and the one the HTCondor
-dev team has historically been bitten by.
+**What already exists (golang-htcondor `droppriv`).** On **Linux**, `runAsUser`
+does `runtime.LockOSThread()` + `setfsuid`/`setfsgid` so a single goroutine
+performs filesystem operations as a specific user without affecting other
+goroutines, surfaced as `Open/OpenFile/MkdirAll/Chown(user, …)`. On **non-Linux
+it is a stub** (no switching). It covers file ops only — no process launching,
+no FD passing.
 
-**Current behavior.** `internal/userlog.Manager.emit` does a synchronous
-`open(O_APPEND)` + `flock` + `write` + `close` to the user's log path. Call
-sites by goroutine:
+**Plan.**
+- **Abstraction layer.** Define a backend-neutral privilege-separation interface
+  in terms of concrete, RPC-able operations (open→FD, mkdir, chown, stat,
+  remove, rename, and launch-process-as-user) rather than arbitrary Go
+  closures — a closure can't cross a helper process. Two backends behind it:
+  - **Native (Linux, privileged):** the existing thread-lock + `setfsuid` path,
+    plus process launch via `SysProcAttr.Credential`. Expand to cover process
+    launching.
+  - **Pooled helper (non-Linux e.g. darwin, and a forced test mode):** a fixed
+    number of simultaneous helper processes, one per UID/GID, driven over an RPC
+    the same interface maps onto. Helpers open files under the target
+    credentials and **pass FDs back** (SCM_RIGHTS) so the parent does the I/O on
+    a correctly-owned descriptor; they can also fork/exec processes as the user.
+    The parent reaps idle/unneeded helpers; helpers exit automatically if the
+    parent dies. A mode uses this path **even when not actually switching users**
+    so unprivileged CI exercises the RPC/pool/FD machinery.
+- **Adapt schedd/shadow to the abstraction.** Route the spool sandbox writes
+  (`internal/spool`) and file-transfer landing (`shadow/transfer.go`) through it
+  so input/output/executable files land owned by the job owner, and chown spool
+  dirs appropriately. This is the concrete correctness fix a shared AP needs.
+- Fuller shadow-level isolation (out-of-process setuid shadows for the strict
+  multi-user case vs. goroutine-shadows for the personal-AP fast path) is a
+  later sub-item; the FS-ownership fix above is the first, highest-value step.
 
-- **On the scheduler-core goroutine (acute):** EXECUTE, TERMINATED, EVICTED
-  (`sched.handleStarted` / `handleExited`). A hung log FS here stalls the single
-  goroutine that reaps finished jobs and drives all scheduling — a full daemon
-  freeze, exactly like the advertise bug.
-- On the QMGMT commit goroutine: SUBMIT. A slow FS blocks that one submitter's
-  `condor_submit` and ties up a network goroutine, but does not freeze the core.
-- On the actOnJobs network goroutine: HELD / RELEASED / ABORTED.
-- On per-job reconnect goroutines: DISCONNECTED / RECONNECTED / RECONNECT_FAILED.
+## 2. Job policy expressions
 
-**Step 1 — get log writes off the core (and off any shared serialization
-point). [DONE]** The core (and every handler) enqueues an event and returns; a
-FIXED, BOUNDED pool of writer goroutines (default 32, `SCHEDD_USERLOG_WORKERS`)
-performs the blocking FS I/O. Scheduling never blocks on a user's log
-filesystem. Implementation note: the pool work-steals over a "ready" queue of
-files-with-pending-events, taking exclusive per-file ownership so per-file (and
-thus per-job) FIFO order is preserved; goroutines and open FDs are bounded by
-the pool size regardless of file count (a `log = job_$(Process).log` cluster of
-100k jobs is 100k tiny buffers, NOT 100k goroutines/FDs). See
-`internal/userlog/manager.go`.
+`periodic_hold` / `periodic_release` / `periodic_remove`, `on_exit_hold` /
+`on_exit_remove`, `max_retries`, and allowed-job-duration limits — evaluated
+per job on a timer (the C++ `PERIODIC_EXPR_INTERVAL` loop). The schedd runs a
+fixed state machine today, so jobs can't retry on failure, self-hold on a bad
+exit code, or time out. Core SchedD behavior; self-contained.
 
-**Step 2 — backpressure and per-submitter fairness. [DONE]** Writes are bounded
-**per log file** (`SCHEDD_USERLOG_QUEUE_DEPTH`, default 1024) with a global file
-cap (`SCHEDD_USERLOG_MAX_FILES`) and idle reaping (`SCHEDD_USERLOG_IDLE_TIMEOUT`)
-for memory bounds. Two enqueue disciplines:
+## 3. Late materialization / job factories
 
-- **Core producers (EXECUTE/TERMINATED/EVICTED, and the core shadow-exception
-  HELD): non-blocking.** If the file's buffer is full (a worker wedged on a hung
-  FS), the event is DROPPED and counted with a throttled warning; the core
-  returns instantly. Justified by the queue being the source of truth.
-- **Non-core producers (SUBMIT, action HELD/RELEASED/ABORTED, reconnect trio):
-  bounded backpressure.** A blocking enqueue bounded by
-  `SCHEDD_USERLOG_BACKPRESSURE_TIMEOUT` (default 5s) — blocking that one
-  submitter/tool while their writer is behind, without touching anyone else — then
-  drop-with-warning on timeout so a hung FS can never tie a goroutine up forever.
-  SUBMIT is the primary backpressure point, and its enqueue happens AFTER the
-  queue transaction commits and releases its collection locks (see the CRITICAL
-  note in `internal/queue/txn.go`), so a slow log FS throttles only that submitter,
-  never stalls commits for others on the same shard.
+Submitting 100k jobs materializes 100k proc ads up front (memory + a giant
+SUBMIT/QMGMT burst). HTCondor's job factory materializes lazily up to
+`max_idle`/`max_materialize`. The QMGMT ops (`SetJobFactory`,
+`SendMaterializeData`) are currently stubbed to close the connection politely,
+and the collections engine already has the factory-attr hooks — so this is
+building the materialization engine on scaffolding that exists. Directly
+improves large-cluster scale.
 
-Degradation is bounded: you would need `SCHEDD_USERLOG_WORKERS` distinct hung
-filesystems at once to stall throughput, versus the old single-file freeze of the
-whole daemon. Terminal events are best-effort (queue authoritative), not
-guaranteed — the relaxation that makes the non-blocking core path safe.
+## 4. Remote-submit auth & per-attribute authorization
 
-The remaining relaxation vs. the original "never drop terminal events" wording:
-under a genuinely hung FS we DO drop (with a counter + warning) rather than
-freeze or grow memory unboundedly. This is the explicit best-effort semantics —
-consumers reconcile from the queue.
+Everything is tested with FS auth (same host). A shared AP needs IDTOKENS /
+SCITOKENS submit (cedar implements the verify side), the QMGMT
+protected-attribute / superuser model (users can't set `Owner`, accounting
+attrs, or protected fields on each other's jobs), and secure spool file
+permissions. Pairs with #1.
 
-**Step 3 (harder, deferred) — transactional / recoverable log writes.** Today
-the queue commit and the log write are independent, so a crash between them
-leaves the log and the queue disagreeing (a missing SUBMIT/EXECUTE/TERMINATED,
-or a duplicate on naive replay). The durable design: write the *intent* to emit
-each event into the queue transaction (fast local disk = source of truth), mark
-it flushed once the real write to the user's log lands, and on restart replay
-any unflushed intents. The user log becomes a best-effort projection of durable
-queue state.
+## 5. Observability & operability
 
-Caveat (why this is deferred): recovery is expensive and racy. Idempotent replay
-means detecting already-written events in a file we do not control — users can
-truncate, rotate, or point several jobs at one log — and reconciliation on
-restart re-reads potentially many slow, remote log files. Worth doing, but only
-after steps 1–2, which remove the acute freeze risk on their own.
+The schedd exposes no metrics (the collector already has a Prometheus surface
+to copy), no statistics ad, and the new user-log drop/backpressure counters
+aren't surfaced. Add: a schedd stats ad + Prometheus endpoint, exposure of the
+drop/queue-depth counters, `D_*` debug categories, `condor_q -better-analyze`
+support, and live `SIGHUP` reconfig of the `SCHEDD_*` knobs (several are read
+only at startup today).
 
-## 2. (add future items here)
+## 6. Durable / recoverable user-log writes (was item #1 step 3)
+
+The queue commit and the log write are independent, so a crash between them
+leaves the log and queue disagreeing (a missing SUBMIT/EXECUTE/TERMINATED, or a
+duplicate on naive replay). Durable design: write the *intent* to emit each
+event into the queue transaction (fast local disk = source of truth), mark it
+flushed once the real write lands, replay unflushed intents on restart.
+Deferred because consumers (DAGMan, condor_wait) reconcile from the queue, so a
+degraded log loses observability, never job state. Expensive/racy recovery
+(idempotent replay against files users can truncate/rotate) is why it's last.
