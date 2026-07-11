@@ -38,6 +38,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/stream"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/startd"
 )
 
@@ -197,6 +198,14 @@ type Config struct {
 	OnEvent func(Event)
 	// Logf, if set, receives debug logging (e.g. testing.T.Logf).
 	Logf func(format string, args ...any)
+	// Privsep, if set, performs the file-transfer per-user filesystem ops as the
+	// job Owner: the input sandbox files are READ as the owner (so we never read
+	// a file with more privilege than the user has) and the output sandbox lands
+	// WRITTEN as the owner (so results are owned by the user, not the schedd
+	// uid). nil uses the process-wide native Privsep (droppriv.DefaultPrivsep),
+	// which for a personal/unprivileged AP runs as the current user -- identical
+	// to the pre-privsep behavior.
+	Privsep droppriv.Privsep
 }
 
 // Shadow serves one starter over one activated-claim connection. Create it

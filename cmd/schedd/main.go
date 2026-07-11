@@ -27,6 +27,7 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/advertise"
@@ -40,6 +41,13 @@ import (
 )
 
 func main() {
+	// MUST be the very first statement: when the droppriv pool backend spawns a
+	// per-user helper it re-execs THIS binary with a private sentinel set;
+	// RunHelperIfRequested detects that, serves the helper control protocol, and
+	// exits without ever returning. In the normal daemon launch (no sentinel) it
+	// returns immediately and main() proceeds untouched.
+	droppriv.RunHelperIfRequested()
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "golang-ap schedd:", err)
 		os.Exit(1)
@@ -209,6 +217,18 @@ func run() error {
 		log.Warn(logging.DestinationGeneral, fmt.Sprintf(format, args...))
 	})
 	jobQueue.SetUserLog(ulogMgr)
+
+	// Privilege-separation backend: routes the per-user spool + transfer file ops
+	// through the job Owner's identity. Defaults to ModeNative, which on a
+	// personal/unprivileged AP does no privilege switch and spawns no helpers
+	// (byte-for-byte the pre-privsep behavior); a privileged deployment switches
+	// for real, and SCHEDD_PRIVSEP_MODE=pool exercises the helper/FD-passing path.
+	privsep, err := buildPrivsep(cfg, log)
+	if err != nil {
+		return fmt.Errorf("building privsep: %w", err)
+	}
+	// Close after the scheduler stops (LIFO): reaps every pool helper so none leak.
+	defer func() { _ = privsep.Close() }()
 	// Flush buffered user-log events on shutdown. Registered before
 	// scheduler.Stop's defer so (LIFO) it runs AFTER the core drains -- capturing
 	// the final EXECUTE/TERMINATED/EVICTED events the drain emits -- and before
@@ -247,6 +267,7 @@ func run() error {
 		ReconnectDisabled: !configBool(cfg, "SCHEDD_RECONNECT", true),
 		DefaultJobLease:   configInt(cfg, "JOB_DEFAULT_LEASE_DURATION", sched.DefaultJobLeaseDuration),
 		UserLog:           ulogMgr,
+		Privsep:           privsep,
 	})
 
 	// NEGOTIATE (416): the negotiator's matchmaking. Registered at NEGOTIATOR (and
@@ -269,6 +290,7 @@ func run() error {
 				scheduler.Reschedule()
 			}
 		},
+		Privsep: privsep,
 	}).Register(srv)
 	// When a spooled job's output sandbox lands back in $(SPOOL) (shadow
 	// FILETRANS_DOWNLOAD), record the spooled output list on the job ad —
@@ -440,6 +462,42 @@ func writeAddressFile(d *daemon.Daemon, cfg *config.Config, ln net.Listener) str
 		return ""
 	}
 	return path
+}
+
+// buildPrivsep constructs the schedd's droppriv.Privsep from the SCHEDD_PRIVSEP_*
+// knobs. It defaults to ModeNative so a personal/single-user AP keeps its exact
+// current behavior (no privilege switch, no helper processes); privileged
+// deployments get real per-user switching, and SCHEDD_PRIVSEP_MODE=pool selects
+// the helper/FD-passing backend (with SCHEDD_PRIVSEP_FORCE_UNPRIVILEGED=true it
+// runs the full helper machinery without root, for CI).
+func buildPrivsep(cfg *config.Config, log *logging.Logger) (droppriv.Privsep, error) {
+	mode := droppriv.ModeNative
+	switch strings.ToLower(strings.TrimSpace(configOrEnv(cfg, "SCHEDD_PRIVSEP_MODE"))) {
+	case "", "native":
+		mode = droppriv.ModeNative
+	case "auto":
+		mode = droppriv.ModeAuto
+	case "pool":
+		mode = droppriv.ModePool
+	default:
+		return nil, fmt.Errorf("SCHEDD_PRIVSEP_MODE must be auto|native|pool, got %q",
+			configOrEnv(cfg, "SCHEDD_PRIVSEP_MODE"))
+	}
+	cfgPS := droppriv.PrivsepConfig{
+		Mode:                    mode,
+		ForceHelperUnprivileged: configBool(cfg, "SCHEDD_PRIVSEP_FORCE_UNPRIVILEGED", false),
+		MaxHelpers:              configInt(cfg, "SCHEDD_PRIVSEP_MAX_HELPERS", 0),
+		HelperIdleTimeout:       configSeconds(cfg, "SCHEDD_PRIVSEP_IDLE_TIMEOUT", 0),
+	}
+	ps, err := droppriv.NewPrivsep(cfgPS)
+	if err != nil {
+		return nil, err
+	}
+	log.Info(logging.DestinationGeneral, "privsep backend ready",
+		"mode", configOrEnv(cfg, "SCHEDD_PRIVSEP_MODE"),
+		"force_unprivileged", cfgPS.ForceHelperUnprivileged,
+		"euid", os.Geteuid())
+	return ps, nil
 }
 
 func configSeconds(cfg *config.Config, key string, def time.Duration) time.Duration {

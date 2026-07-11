@@ -56,6 +56,7 @@ import (
 	"github.com/bbockelm/cedar/message"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/filetransfer"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
@@ -78,6 +79,13 @@ type Options struct {
 	// scheduler advertises the freshly-released job promptly (the C++ reaper
 	// re-arms the negotiator).
 	Reschedule func()
+	// Privsep, if set, performs every per-user filesystem op (sandbox creation,
+	// received-file writes, spooled-file reads) as the job Owner so files land
+	// owned by the user, not the schedd uid. nil uses the process-wide native
+	// Privsep (droppriv.DefaultPrivsep), which for a personal/unprivileged AP is
+	// a no-op that runs as the current user -- identical to the pre-privsep
+	// behavior.
+	Privsep droppriv.Privsep
 }
 
 // Handler serves the four spool/transfer commands.
@@ -86,6 +94,7 @@ type Handler struct {
 	spoolDir   string
 	logf       func(format string, args ...any)
 	reschedule func()
+	ps         droppriv.Privsep
 }
 
 // New builds a Handler.
@@ -94,7 +103,61 @@ func New(opts Options) *Handler {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Handler{q: opts.Queue, spoolDir: opts.SpoolDir, logf: logf, reschedule: opts.Reschedule}
+	ps := opts.Privsep
+	if ps == nil {
+		ps = droppriv.DefaultPrivsep()
+	}
+	return &Handler{q: opts.Queue, spoolDir: opts.SpoolDir, logf: logf, reschedule: opts.Reschedule, ps: ps}
+}
+
+// privsepUser maps a job ad's Owner to the droppriv user to run per-user file
+// ops as. droppriv rejects "root"/"condor" and treats "" as "run as the current
+// user, no privilege switch" (the personal-AP / unprivileged no-op), so any
+// owner that is not a normal username falls back to "".
+func privsepUser(owner string) string {
+	owner = strings.TrimSpace(owner)
+	if owner == "" || owner == "root" || owner == "condor" {
+		return ""
+	}
+	return owner
+}
+
+// ownerOf returns the privsep user for job c.p, read from its ad's Owner.
+func (h *Handler) ownerOf(c, p int) string {
+	if ad, ok := h.q.Get(c, p); ok {
+		owner, _ := ad.EvaluateAttrString("Owner")
+		return privsepUser(owner)
+	}
+	return ""
+}
+
+// chownSandbox, on a privileged schedd (euid 0), changes ownership of the whole
+// per-job spool sandbox tree to the job owner's uid/gid so spooled files land
+// owned by the user, not the schedd. It is best-effort: an unprivileged schedd
+// (personal AP / CI pool mode) cannot chown to another uid, so it is skipped
+// there (files created via Privsep as the owner already carry the right owner on
+// a privileged backend anyway; this covers the sandbox's parent directories).
+func (h *Handler) chownSandbox(ctx context.Context, dir, owner string) {
+	if owner == "" || os.Geteuid() != 0 {
+		return
+	}
+	info, err := droppriv.LookupUser(ctx, owner)
+	if err != nil {
+		h.logf("spool: cannot resolve owner %q to chown sandbox %s: %v", owner, dir, err)
+		return
+	}
+	uid, gid := int(info.UID), int(info.GID)
+	_ = filepath.WalkDir(dir, func(p string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		// user "" runs the chown as the current (privileged) identity, which is
+		// what is allowed to change a file's owner to an arbitrary uid.
+		if cerr := h.ps.Chown(ctx, "", p, uid, gid); cerr != nil {
+			h.logf("spool: chown %s to %d:%d failed: %v", p, uid, gid, cerr)
+		}
+		return nil
+	})
 }
 
 // Register wires the four commands onto srv at WRITE (matching the C++ schedd's
@@ -181,16 +244,23 @@ func (h *Handler) doSpool(ctx context.Context, c *cedarserver.Conn) error {
 	opts.ReceiveAck = true
 	for _, j := range jobs {
 		dir := SandboxDir(h.spoolDir, j[0], j[1])
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		owner := h.ownerOf(j[0], j[1])
+		// Create the per-job sandbox and land every received file AS the job
+		// owner (droppriv), so on a privileged schedd the sandbox tree is owned
+		// by the user rather than the schedd uid.
+		if err := h.ps.MkdirAll(ctx, owner, dir, 0o755); err != nil {
 			return fmt.Errorf("create spool sandbox %s: %w", dir, err)
 		}
-		sink := &dirSink{root: dir, logf: h.logf}
+		sink := &dirSink{root: dir, ps: h.ps, owner: owner, ctx: ctx, logf: h.logf}
 		res, err := filetransfer.ServeDownload(ctx, c.Stream, sink, opts)
 		if err != nil {
 			return fmt.Errorf("receive sandbox for job %d.%d: %w", j[0], j[1], err)
 		}
-		h.logf("spool: received sandbox for %d.%d into %s (files=%v dirs=%v)",
-			j[0], j[1], dir, res.Files, res.Dirs)
+		// Belt-and-suspenders on a privileged schedd: chown the whole sandbox
+		// tree (including parent dirs) to the owner's uid/gid.
+		h.chownSandbox(ctx, dir, owner)
+		h.logf("spool: received sandbox for %d.%d into %s (files=%v dirs=%v, owner=%q)",
+			j[0], j[1], dir, res.Files, res.Dirs, owner)
 	}
 
 	// Post-transfer: StageInFinish + rewrite ad to point into the spool sandbox +
@@ -349,7 +419,8 @@ func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
 // the best-effort read consumes.
 func (h *Handler) sendSandbox(ctx context.Context, st *stream.Stream, ad *classad.ClassAd, c, p int) error {
 	dir := SandboxDir(h.spoolDir, c, p)
-	specs, size, err := h.outputSpecs(ad, dir)
+	owner, _ := ad.EvaluateAttrString("Owner")
+	specs, size, err := h.outputSpecs(ctx, privsepUser(owner), ad, dir)
 	if err != nil {
 		return err
 	}
@@ -396,7 +467,7 @@ func (h *Handler) sendSandbox(ctx context.Context, st *stream.Stream, ad *classa
 // TransferOutput/TransferOutputFiles, each augmented with Out/Err/UserLog when
 // those live in the sandbox; if neither list exists, the whole sandbox.
 // Missing listed files are skipped with a log (e.g. output the job never wrote).
-func (h *Handler) outputSpecs(ad *classad.ClassAd, dir string) ([]filetransfer.FileSpec, int64, error) {
+func (h *Handler) outputSpecs(ctx context.Context, owner string, ad *classad.ClassAd, dir string) ([]filetransfer.FileSpec, int64, error) {
 	var names []string
 	haveList := false
 	if s, ok := ad.EvaluateAttrString("SpooledOutputFiles"); ok && s != "" {
@@ -410,7 +481,7 @@ func (h *Handler) outputSpecs(ad *classad.ClassAd, dir string) ([]filetransfer.F
 		haveList = true
 	}
 	if !haveList {
-		return collectSandbox(dir)
+		return h.collectSandbox(ctx, owner, dir)
 	}
 	// Out/Err/UserLog ride along when using a fixed list (file_transfer.cpp:620).
 	for _, attr := range []string{"Out", "Err", "UserLog"} {
@@ -438,7 +509,9 @@ func (h *Handler) outputSpecs(ad *classad.ClassAd, dir string) ([]filetransfer.F
 			WireName: name,
 			Mode:     int64(info.Mode().Perm()),
 			Size:     info.Size(),
-			Open:     func() (io.ReadCloser, error) { return os.Open(open) },
+			// Read the spooled file back AS the job owner, so we never read a
+			// file with more privilege than the user has.
+			Open: func() (io.ReadCloser, error) { return h.ps.OpenFile(ctx, owner, open, os.O_RDONLY, 0) },
 		})
 		total += info.Size()
 	}
@@ -461,7 +534,7 @@ func splitFileList(list string) []string {
 
 // collectSandbox walks dir and returns a FileSpec per regular file (wire name =
 // path relative to dir), plus the total byte size.
-func collectSandbox(dir string) ([]filetransfer.FileSpec, int64, error) {
+func (h *Handler) collectSandbox(ctx context.Context, owner, dir string) ([]filetransfer.FileSpec, int64, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		// No sandbox on disk (e.g. an empty spool): nothing to send.
 		return nil, 0, nil
@@ -492,7 +565,8 @@ func collectSandbox(dir string) ([]filetransfer.FileSpec, int64, error) {
 			WireName: wire,
 			Mode:     int64(info.Mode().Perm()),
 			Size:     info.Size(),
-			Open:     func() (io.ReadCloser, error) { return os.Open(src) },
+			// Read the spooled file back AS the job owner.
+			Open: func() (io.ReadCloser, error) { return h.ps.OpenFile(ctx, owner, src, os.O_RDONLY, 0) },
 		})
 		total += info.Size()
 		return nil
@@ -673,8 +747,11 @@ var nowUnix = func() int64 { return time.Now().Unix() }
 // (the per-job spool sandbox), preserving the wire names as relative paths and
 // guarding against path traversal outside root.
 type dirSink struct {
-	root string
-	logf func(format string, args ...any)
+	root  string
+	ps    droppriv.Privsep
+	owner string
+	ctx   context.Context
+	logf  func(format string, args ...any)
 }
 
 func (s *dirSink) dest(name string) (string, error) {
@@ -690,7 +767,7 @@ func (s *dirSink) Mkdir(name string) error {
 	if err != nil {
 		return err
 	}
-	return os.MkdirAll(dst, 0o755)
+	return s.ps.MkdirAll(s.ctx, s.owner, dst, 0o755)
 }
 
 func (s *dirSink) File(name string, mode int64, _ int64) (io.WriteCloser, error) {
@@ -698,19 +775,21 @@ func (s *dirSink) File(name string, mode int64, _ int64) (io.WriteCloser, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := s.ps.MkdirAll(s.ctx, s.owner, filepath.Dir(dst), 0o755); err != nil {
 		return nil, err
 	}
 	perm := os.FileMode(mode).Perm()
 	if perm == 0 {
 		perm = 0o644
 	}
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	// Create the received sandbox file AS the job owner (FD-passed back from the
+	// helper on the pool backend), so it lands owned by the user.
+	f, err := s.ps.OpenFile(s.ctx, s.owner, dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 	if err != nil {
 		return nil, err
 	}
 	if s.logf != nil {
-		s.logf("spool: writing sandbox file %s (mode %o)", dst, perm)
+		s.logf("spool: writing sandbox file %s (mode %o, owner %q)", dst, perm, s.owner)
 	}
 	return f, nil
 }

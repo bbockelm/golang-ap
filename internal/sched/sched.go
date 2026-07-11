@@ -45,6 +45,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/security"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/logging"
 	"github.com/bbockelm/golang-htcondor/startd"
 
@@ -140,6 +141,11 @@ type Options struct {
 	// JOB_TERMINATED, JOB_EVICTED, and the reconnect events) at the matching
 	// transitions so condor_wait / DAGMan can follow the job. nil disables them.
 	UserLog *userlog.Manager
+
+	// Privsep, if set, is threaded into every shadow so the job's input/output
+	// sandbox file ops run as the job Owner. nil lets the shadow default to the
+	// process-wide native Privsep (run as the current user).
+	Privsep droppriv.Privsep
 }
 
 // jobKey identifies a job proc.
@@ -194,6 +200,7 @@ type Scheduler struct {
 	reconnectDisabled bool
 	defaultJobLease   int
 	userlog           *userlog.Manager
+	privsep           droppriv.Privsep
 
 	events chan Event
 	// advertiseNudge asks the (separate) advertiser goroutine to push ads now,
@@ -256,6 +263,7 @@ func New(opts Options) *Scheduler {
 		reconnectDisabled: opts.ReconnectDisabled,
 		defaultJobLease:   jobLease,
 		userlog:           opts.UserLog,
+		privsep:           opts.Privsep,
 		events:            make(chan Event, 256),
 		advertiseNudge:    make(chan struct{}, 1),
 		running:           map[jobKey]*runInfo{},
@@ -698,6 +706,7 @@ func (s *Scheduler) runJob(ctx context.Context, m negotiate.Match, job *classad.
 		UIDDomain:        s.uidDomain,
 		Startd:           client,
 		Detach:           detach,
+		Privsep:          s.privsep,
 		OnEvent: func(ev shadow.Event) {
 			if ev.Type == shadow.EventBeginExecution && s.consumePanicHook(c, p) {
 				panic(fmt.Sprintf("test hook: injected shadow panic for job %d.%d "+
@@ -1208,6 +1217,7 @@ func (s *Scheduler) reconnectJob(ctx context.Context, c, p int, claimID string, 
 		UIDDomain:        s.uidDomain,
 		Startd:           sc,
 		Detach:           detach,
+		Privsep:          s.privsep,
 		Logf: func(format string, args ...any) {
 			s.log.Debug(logging.DestinationGeneral, fmt.Sprintf(format, args...))
 		},

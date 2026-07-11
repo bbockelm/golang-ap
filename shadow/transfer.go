@@ -53,6 +53,7 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/filetransfer"
 )
 
@@ -427,14 +428,42 @@ func (s *Shadow) teardownTransfer() {
 	}
 }
 
+// privsep returns the Privsep to route per-user file ops through, defaulting to
+// the process-wide native one (which for a personal/unprivileged AP runs as the
+// current user, a no-op switch).
+func (s *Shadow) privsep() droppriv.Privsep {
+	if s.cfg.Privsep != nil {
+		return s.cfg.Privsep
+	}
+	return droppriv.DefaultPrivsep()
+}
+
+// privsepUser maps a job Owner to the droppriv user to run per-user file ops as.
+// droppriv rejects "root"/"condor" and treats "" as "run as the current user,
+// no privilege switch", so any owner that is not a normal username maps to "".
+func privsepUser(owner string) string {
+	owner = strings.TrimSpace(owner)
+	if owner == "" || owner == "root" || owner == "condor" {
+		return ""
+	}
+	return owner
+}
+
 // buildInputPlan builds the list of files the shadow uploads to the starter: the
 // executable (as basename(Cmd), when TransferExecutable is not false) followed
 // by the TransferInput files. Sources are resolved against Iwd for relative
 // paths. FinalTransfer is true so the starter lands them in the execute sandbox.
+// Each file is opened AS the job owner so we never read a file with more
+// privilege than the user has.
 func (s *Shadow) buildInputPlan() (filetransfer.SendPlan, error) {
 	ad := s.cfg.JobAd
 	iwd, _ := ad.EvaluateAttrString("Iwd")
 	plan := filetransfer.SendPlan{FinalTransfer: true}
+
+	ps := s.privsep()
+	ownerRaw, _ := ad.EvaluateAttrString("Owner")
+	owner := privsepUser(ownerRaw)
+	ctx := context.Background()
 
 	seen := map[string]bool{}
 	add := func(wireName, source string) error {
@@ -450,7 +479,7 @@ func (s *Shadow) buildInputPlan() (filetransfer.SendPlan, error) {
 			WireName: wireName,
 			Mode:     int64(info.Mode().Perm()),
 			Size:     info.Size(),
-			Open:     func() (io.ReadCloser, error) { return os.Open(src) },
+			Open:     func() (io.ReadCloser, error) { return ps.OpenFile(ctx, owner, src, os.O_RDONLY, 0) },
 		})
 		seen[wireName] = true
 		return nil
@@ -494,13 +523,25 @@ func (s *Shadow) buildOutputSink() (filetransfer.Sink, error) {
 	if errf, _ := ad.EvaluateAttrString("Err"); errf != "" && errf != stderrRemapName && errf != "/dev/null" {
 		remap[stderrRemapName] = errf
 	}
-	return &iwdSink{iwd: iwd, remap: remap, logf: s.logf}, nil
+	ownerRaw, _ := ad.EvaluateAttrString("Owner")
+	return &iwdSink{
+		iwd:   iwd,
+		remap: remap,
+		ps:    s.privsep(),
+		owner: privsepUser(ownerRaw),
+		ctx:   context.Background(),
+		logf:  s.logf,
+	}, nil
 }
 
-// iwdSink writes received output files into the job's Iwd.
+// iwdSink writes received output files into the job's Iwd, AS the job owner so
+// results land owned by the user rather than the schedd uid.
 type iwdSink struct {
 	iwd   string
 	remap map[string]string
+	ps    droppriv.Privsep
+	owner string
+	ctx   context.Context
 	logf  func(format string, args ...any)
 }
 
@@ -520,7 +561,7 @@ func (s *iwdSink) Mkdir(name string) error {
 	if err != nil {
 		return err
 	}
-	return os.MkdirAll(dst, 0o755)
+	return s.ps.MkdirAll(s.ctx, s.owner, dst, 0o755)
 }
 
 func (s *iwdSink) File(name string, mode int64, _ int64) (io.WriteCloser, error) {
@@ -528,19 +569,19 @@ func (s *iwdSink) File(name string, mode int64, _ int64) (io.WriteCloser, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := s.ps.MkdirAll(s.ctx, s.owner, filepath.Dir(dst), 0o755); err != nil {
 		return nil, err
 	}
 	perm := os.FileMode(mode).Perm()
 	if perm == 0 {
 		perm = 0o644
 	}
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	f, err := s.ps.OpenFile(s.ctx, s.owner, dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 	if err != nil {
 		return nil, err
 	}
 	if s.logf != nil {
-		s.logf("shadow: writing output file %s (mode %o)", dst, perm)
+		s.logf("shadow: writing output file %s (mode %o, owner %q)", dst, perm, s.owner)
 	}
 	return f, nil
 }

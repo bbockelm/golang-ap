@@ -1,11 +1,13 @@
 package spool
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/bbockelm/golang-htcondor/droppriv"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
@@ -131,7 +133,7 @@ func TestOutputSpecsPriority(t *testing.T) {
 	h := New(Options{SpoolDir: dir})
 
 	names := func(ad *classad.ClassAd) []string {
-		specs, _, err := h.outputSpecs(ad, dir)
+		specs, _, err := h.outputSpecs(context.Background(), "", ad, dir)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -167,7 +169,7 @@ func TestOutputSpecsPriority(t *testing.T) {
 }
 
 func TestDirSinkTraversalGuard(t *testing.T) {
-	s := &dirSink{root: t.TempDir()}
+	s := &dirSink{root: t.TempDir(), ps: droppriv.DefaultPrivsep(), ctx: context.Background()}
 	if _, err := s.File("../evil", 0o644, 0); err == nil {
 		t.Error("dirSink accepted ../ traversal")
 	}
