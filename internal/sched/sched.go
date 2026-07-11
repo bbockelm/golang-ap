@@ -970,7 +970,9 @@ func (s *Scheduler) jobFailed(c, p int, why string, count bool) {
 	if s.userlog != nil {
 		if ad, ok := s.q.Get(c, p); ok {
 			if held {
-				s.userlog.Held(ad,
+				// Core goroutine: use the non-blocking HeldCore so a hung log FS
+				// can never freeze scheduling (the queue-action Held backpressures).
+				s.userlog.HeldCore(ad,
 					fmt.Sprintf("Job has failed %d times; last failure: %s", excepts, why),
 					holdCodeShadowException, 0)
 			} else {

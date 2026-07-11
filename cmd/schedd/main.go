@@ -193,10 +193,31 @@ func run() error {
 	// DAGMan can follow jobs: the queue writes SUBMIT at commit and
 	// HELD/RELEASED/ABORTED on the action path; the scheduler core writes the
 	// run-side events (EXECUTE/TERMINATED/EVICTED and the reconnect trio).
-	ulogMgr := userlog.New(scheddSinful, func(format string, args ...any) {
+	//
+	// Writes are asynchronous and off-core: a fixed, bounded pool of writer
+	// goroutines drains per-file buffers, so a slow/hung user-log filesystem
+	// can never freeze scheduling (core producers drop-on-full; submit and the
+	// action/reconnect paths backpressure). See internal/userlog and ROADMAP #1.
+	ulogGrace := configSeconds(cfg, "SCHEDD_SHUTDOWN_DRAIN_GRACE", sched.DefaultDrainGrace)
+	ulogMgr := userlog.New(scheddSinful, userlog.Config{
+		Workers:       configInt(cfg, "SCHEDD_USERLOG_WORKERS", 32),
+		QueueDepth:    configInt(cfg, "SCHEDD_USERLOG_QUEUE_DEPTH", 1024),
+		SubmitTimeout: configSeconds(cfg, "SCHEDD_USERLOG_BACKPRESSURE_TIMEOUT", 5*time.Second),
+		IdleTimeout:   configSeconds(cfg, "SCHEDD_USERLOG_IDLE_TIMEOUT", 60*time.Second),
+		MaxFiles:      configInt(cfg, "SCHEDD_USERLOG_MAX_FILES", 8192),
+	}, func(format string, args ...any) {
 		log.Warn(logging.DestinationGeneral, fmt.Sprintf(format, args...))
 	})
 	jobQueue.SetUserLog(ulogMgr)
+	// Flush buffered user-log events on shutdown. Registered before
+	// scheduler.Stop's defer so (LIFO) it runs AFTER the core drains -- capturing
+	// the final EXECUTE/TERMINATED/EVICTED events the drain emits -- and before
+	// the queue Close.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), ulogGrace)
+		defer cancel()
+		ulogMgr.Close(ctx)
+	}()
 	scheduler = sched.New(sched.Options{
 		Logger:            log,
 		AdvertiseInterval: configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second),

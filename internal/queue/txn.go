@@ -228,6 +228,13 @@ func (t *Txn) Commit() error {
 	// Emit it here for each newly created proc, reading the flattened (cluster
 	// attrs merged) ad so UserLog/Iwd are resolvable. Done after the durable
 	// write so a failed commit logs nothing.
+	//
+	// CRITICAL (ROADMAP #1): this runs AFTER coll.Update/Delete have returned,
+	// so no collection/shard lock is held here. Submit applies user-log
+	// backpressure (a bounded-blocking enqueue) when the submitter's log FS is
+	// behind; keeping it outside the collection lock ensures a slow log FS
+	// throttles only this submitter, never stalls commits for other writers on
+	// the same shard. Do not move this inside the locked region above.
 	if t.q.ulog != nil {
 		for key := range t.newProcs {
 			if t.destroyed[key] {
