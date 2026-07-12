@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,11 +34,13 @@ import (
 	"github.com/bbockelm/golang-ap/internal/advertise"
 	"github.com/bbockelm/golang-ap/internal/factory"
 	"github.com/bbockelm/golang-ap/internal/match"
+	"github.com/bbockelm/golang-ap/internal/metrics"
 	"github.com/bbockelm/golang-ap/internal/negotiate"
 	"github.com/bbockelm/golang-ap/internal/policy"
 	"github.com/bbockelm/golang-ap/internal/queue"
 	"github.com/bbockelm/golang-ap/internal/sched"
 	"github.com/bbockelm/golang-ap/internal/spool"
+	"github.com/bbockelm/golang-ap/internal/stats"
 	"github.com/bbockelm/golang-ap/internal/userlog"
 	"github.com/bbockelm/golang-ap/shadow"
 )
@@ -67,6 +70,7 @@ func run() error {
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
 	_ = flag.Bool("f", false, "run in the foreground; accepted for compatibility")
 	_ = flag.Bool("t", false, "log to the terminal; accepted for compatibility")
+	metricsAddr := flag.String("metrics", "", "if set (e.g. \":9721\"), serve Prometheus metrics at /metrics on this address; overrides SCHEDD_METRICS_ADDRESS")
 	flag.Parse()
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "SCHEDD", LocalName: *localName})
@@ -181,6 +185,12 @@ func run() error {
 	endpoint := shadow.NewSharedEndpoint(srv, sessionCache, scheddSinful,
 		func(format string, args ...any) { log.Debug(logging.DestinationGeneral, fmt.Sprintf(format, args...)) })
 
+	// Shared runtime-statistics collector: the scheduler core, negotiate handler,
+	// and factory engine increment its cumulative counters at the real events; the
+	// /metrics endpoint and the Scheduler ad both read a consistent Snapshot from
+	// it. Its live gauges are wired (SetGauges) once every component exists.
+	statsColl := stats.New()
+
 	// The scheduler core owns the running-job registry and every job-queue
 	// transition; it also pushes the Scheduler + Submitter ads on each
 	// SCHEDD_INTERVAL tick (and on a RESCHEDULE nudge).
@@ -198,6 +208,7 @@ func run() error {
 		AddressFn:    func() string { return wrapSinful(schedAddr(d, ln)) },
 		CountsFn:     queueCountsFn(jobQueue),
 		SubmittersFn: submittersFn(jobQueue),
+		StatsFn:      func() stats.Snapshot { return statsColl.Snapshot() },
 	})
 	// User-job-log events (`log = ...` in the submit file), so condor_wait and
 	// DAGMan can follow jobs: the queue writes SUBMIT at commit and
@@ -245,6 +256,7 @@ func run() error {
 	// runs off the scheduler core and is nudged whenever a job leaves Idle.
 	matEngine := factory.NewEngine(jobQueue, log,
 		configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
+	matEngine.SetStats(statsColl)
 	// Materialize a freshly submitted factory immediately (not on the next tick).
 	jobQueue.SetFactoryNudge(matEngine.Nudge)
 
@@ -287,11 +299,30 @@ func run() error {
 		// expressions plus the pool-wide SYSTEM_PERIODIC_* expressions.
 		PeriodicInterval: configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval),
 		SysPolicy:        buildSysPolicy(cfg),
+		Stats:            statsColl,
+	})
+
+	// Wire the stats collector's live gauges now that the queue, scheduler, factory
+	// engine, and user-log manager all exist. Each source is concurrency-safe and
+	// read on demand by the /metrics scrape and the advertiser.
+	statsColl.SetGauges(stats.GaugeSources{
+		Counts: func() stats.Counts {
+			c := jobQueue.Counts()
+			return stats.Counts{
+				Total: c.Total, Idle: c.Idle, Running: c.Running, Held: c.Held,
+				Removed: c.Removed, Completed: c.Completed, Users: c.Owners,
+			}
+		},
+		ShadowsRunning:   scheduler.ShadowsRunning,
+		FactoriesActive:  func() int { return len(jobQueue.FactoryClusters()) },
+		UserlogFilesOpen: ulogMgr.NumFiles,
+		UserlogDropped:   ulogMgr.Dropped,
 	})
 
 	// NEGOTIATE (416): the negotiator's matchmaking. Registered at NEGOTIATOR (and
 	// WRITE) like the C++ schedd; granted matches feed the scheduler core.
 	neg := negotiate.New(jobQueue, log, scheduler.OnMatch)
+	neg.SetStats(statsColl)
 	srv.Handle(int(commands.NEGOTIATE), neg.Handle, "NEGOTIATOR", "WRITE")
 
 	// Sandbox spooling (condor_submit -spool / condor_transfer_data):
@@ -327,6 +358,21 @@ func run() error {
 	// Claimed.
 	jobQueue.SetOnVacateRunning(func(c, p int) { scheduler.TeardownJobAndWait(c, p, 5*time.Second) })
 
+	// Optional Prometheus /metrics endpoint (SCHEDD_METRICS_ADDRESS or -metrics),
+	// serving the runtime statistics from the shared collector plus Go/process
+	// metrics. Observability, not core function: a bind failure is logged, not fatal.
+	if addr := metricsListenAddr(cfg, *metricsAddr); addr != "" {
+		startMetrics(ctx, addr, statsColl, log)
+	}
+
+	// Live reconfig: on SIGHUP / DC_RECONFIG the daemon reloads config and invokes
+	// this callback, which pushes the re-read SCHEDD_* knobs into the running
+	// components (see reconfigure). Registered before Start so a reconfig that
+	// races startup still lands on live components.
+	d.OnReconfig(func(newCfg *config.Config) {
+		reconfigure(newCfg, log, scheduler, matEngine, jobQueue)
+	})
+
 	scheduler.Start(ctx)
 	// Start the late-materialization engine (its own goroutine; returns on ctx
 	// cancel). Started after the core so an initial sweep can advertise promptly.
@@ -345,6 +391,69 @@ func run() error {
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster(), "name", scheddName(cfg, *localName))
 
 	return d.Serve(ctx, ln, srv.Serve)
+}
+
+// reconfigure re-reads the reconfigurable SCHEDD_* knobs (from the freshly
+// reloaded config) and pushes them into the running components. It is invoked on
+// SIGHUP / DC_RECONFIG (condor_reconfig -daemon schedd). Each target holds its
+// interval/config behind an atomic or mutex, so these updates are safe to apply
+// from the reconfigure goroutine while the components run.
+//
+// Live (updated here):
+//   - SCHEDD_INTERVAL            -> advertise ticker cadence
+//   - PERIODIC_EXPR_INTERVAL     -> periodic-policy evaluator cadence
+//   - SCHEDD_MATERIALIZE_INTERVAL-> late-materialization engine cadence
+//   - SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON/_SUBCODE) -> recompiled policy
+//   - QUEUE_SUPER_USERS, IMMUTABLE/PROTECTED/SECURE_JOB_ATTRS,
+//     QUEUE_ALL_USERS_TRUSTED, IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS -> queue authz
+//
+// Still startup-only (documented, not reconfigured here): the listener / shared-port
+// endpoint and command address, SCHEDD_NAME, UID_DOMAIN, the security policy
+// (SEC_*), MAX_JOBS_RUNNING, MAX_SHADOW_EXCEPTIONS, ALIVE_INTERVAL, the userlog
+// worker-pool sizing (SCHEDD_USERLOG_*), the privsep mode, SCHEDD_RECONNECT, and the
+// spool/queue location.
+func reconfigure(cfg *config.Config, log *logging.Logger, scheduler *sched.Scheduler,
+	matEngine *factory.Engine, jobQueue *queue.Queue) {
+	scheduler.SetAdvertiseInterval(configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second))
+	scheduler.SetPeriodicInterval(configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval))
+	scheduler.SetSysPolicy(buildSysPolicy(cfg))
+	matEngine.SetInterval(configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
+	jobQueue.SetAuthz(queueAuthzOptions(cfg))
+	log.Info(logging.DestinationGeneral, "reconfig applied: schedd knobs re-read",
+		"schedd_interval", configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second).String(),
+		"periodic_expr_interval", configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval).String(),
+		"materialize_interval", configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval).String())
+}
+
+// metricsListenAddr resolves the Prometheus metrics listen address: the -metrics
+// flag if set, else the SCHEDD_METRICS_ADDRESS config knob, else "" (disabled).
+func metricsListenAddr(cfg *config.Config, flagAddr string) string {
+	if flagAddr != "" {
+		return flagAddr
+	}
+	if v, ok := cfg.Get("SCHEDD_METRICS_ADDRESS"); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// startMetrics serves the schedd's Prometheus metrics at /metrics on addr until
+// ctx is cancelled. Bind failures are logged, not fatal -- metrics are
+// observability, not core function.
+func startMetrics(ctx context.Context, addr string, st *stats.Collector, log *logging.Logger) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler(st))
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		log.Info(logging.DestinationGeneral, "metrics endpoint listening", "addr", addr, "path", "/metrics")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error(logging.DestinationGeneral, "metrics endpoint stopped", "err", err.Error())
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
 }
 
 // scheddName derives the schedd's Name attribute: SCHEDD_NAME if configured,

@@ -108,7 +108,7 @@ func permErr(format string, args ...any) error {
 // internal writes never call this (they use Queue.Modify / coll.Update directly),
 // so this only ever runs for a client-driven Txn.SetAttribute/DeleteAttribute.
 func (t *Txn) authorize(c, p int, name string) (ignore bool, err error) {
-	az := &t.q.authz
+	az := t.q.authzSnapshot()
 	lname := strings.ToLower(name)
 
 	// Secure attributes: only the schedd's internal API may set them. Mirrors the

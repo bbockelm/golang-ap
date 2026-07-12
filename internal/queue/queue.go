@@ -79,9 +79,13 @@ type Queue struct {
 	hist   *History
 	name   string
 	domain string
-	supers map[string]bool
 
-	authz  authzConfig // per-attribute / ownership QMGMT authorization (see authz.go)
+	// authzMu guards supers + authz so condor_reconfig can swap the QUEUE_SUPER_USERS
+	// / *_JOB_ATTRS / QUEUE_ALL_USERS_TRUSTED authorization live while QMGMT handler
+	// goroutines read it (see SetAuthz / authzSnapshot / IsSuperUser).
+	authzMu sync.RWMutex
+	supers  map[string]bool
+	authz   authzConfig // per-attribute / ownership QMGMT authorization (see authz.go)
 
 	mu     sync.Mutex // guards nextID + counter persistence + factories set
 	nextID int
@@ -176,7 +180,38 @@ func (q *Queue) Close() error {
 
 // IsSuperUser reports whether user is a queue super user.
 func (q *Queue) IsSuperUser(user string) bool {
+	q.authzMu.RLock()
+	defer q.authzMu.RUnlock()
 	return q.supers[user] || q.supers[shortName(user)]
+}
+
+// authzSnapshot returns the current QMGMT authorization config under the read
+// lock. The returned struct shares the (immutable-after-publish) maps SetAuthz
+// installs, so callers must treat them as read-only.
+func (q *Queue) authzSnapshot() authzConfig {
+	q.authzMu.RLock()
+	defer q.authzMu.RUnlock()
+	return q.authz
+}
+
+// SetAuthz replaces the queue's QMGMT authorization live (condor_reconfig): the
+// QUEUE_SUPER_USERS set and the immutable/protected/secure attribute sets plus
+// the QUEUE_ALL_USERS_TRUSTED / IgnoreSecureAttrs flags, rebuilt from opts exactly
+// as Open does. Transactions already in flight keep the isSuper decision they were
+// stamped with at Begin; new transactions and every subsequent authorize() see the
+// new config. Safe to call from any goroutine.
+func (q *Queue) SetAuthz(opts Options) {
+	supers := map[string]bool{}
+	for _, s := range opts.SuperUsers {
+		if s = strings.TrimSpace(s); s != "" {
+			supers[s] = true
+		}
+	}
+	az := buildAuthzConfig(opts)
+	q.authzMu.Lock()
+	q.supers = supers
+	q.authz = az
+	q.authzMu.Unlock()
 }
 
 // allocClusterID returns the next cluster id and persists the advanced counter

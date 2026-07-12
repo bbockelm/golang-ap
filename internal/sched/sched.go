@@ -53,6 +53,7 @@ import (
 	"github.com/bbockelm/golang-ap/internal/negotiate"
 	"github.com/bbockelm/golang-ap/internal/policy"
 	"github.com/bbockelm/golang-ap/internal/queue"
+	"github.com/bbockelm/golang-ap/internal/stats"
 	"github.com/bbockelm/golang-ap/internal/userlog"
 	"github.com/bbockelm/golang-ap/shadow"
 )
@@ -173,6 +174,12 @@ type Options struct {
 	// engine can promptly top up a factory back to max_idle. nil disables the
 	// nudge (the engine still runs on its own timer).
 	OnJobLeftIdle func()
+
+	// Stats, if set, receives the core's cumulative event counts (JobsStarted,
+	// JobsExited, JobsCompleted, ShadowExceptions, MatchesReceived) surfaced by
+	// the /metrics endpoint and the Scheduler ad. nil disables stats (the Inc*
+	// calls are nil-safe no-ops).
+	Stats *stats.Collector
 }
 
 // jobKey identifies a job proc.
@@ -208,8 +215,18 @@ type runInfo struct {
 // Scheduler is the SchedD core. Construct with New, drive with Start/Stop.
 type Scheduler struct {
 	log       *logging.Logger
-	interval  time.Duration
 	advertise func(context.Context)
+
+	// intervalNS / periodicNS hold the advertise and periodic-policy intervals as
+	// nanosecond atomics so condor_reconfig can retune them live: SetAdvertiseInterval
+	// / SetPeriodicInterval store the new value and signal the owning loop, which
+	// resets its ticker (see advertiseLoop / periodicLoop).
+	intervalNS atomic.Int64
+	periodicNS atomic.Int64
+	// advReset / periodicReset wake the advertise / periodic loops to re-read their
+	// interval after a reconfig. Buffered depth 1: a pending reset coalesces.
+	advReset      chan struct{}
+	periodicReset chan struct{}
 
 	q        *queue.Queue
 	matches  *match.Table
@@ -229,9 +246,18 @@ type Scheduler struct {
 	userlog           *userlog.Manager
 	privsep           droppriv.Privsep
 
-	periodicInterval time.Duration
-	sysPolicy        *policy.System
-	onJobLeftIdle    func()
+	// sysPolicy is the pool-wide SYSTEM_PERIODIC_* policy, held behind an atomic
+	// pointer so condor_reconfig can swap in a recompiled policy while the core and
+	// periodic evaluator read it concurrently (both are nil-safe on *policy.System).
+	sysPolicy     atomic.Pointer[policy.System]
+	onJobLeftIdle func()
+
+	// stats receives the core's cumulative event counts (nil-safe).
+	stats *stats.Collector
+	// runningGauge tracks len(running) as an atomic so ShadowsRunning() can be read
+	// safely off the core goroutine (the map itself is core-goroutine-only). It is
+	// mutated only on the core goroutine, alongside every running-map add/delete.
+	runningGauge atomic.Int64
 
 	events chan Event
 	// advertiseNudge asks the (separate) advertiser goroutine to push ads now,
@@ -292,7 +318,6 @@ func New(opts Options) *Scheduler {
 	}
 	s := &Scheduler{
 		log:               opts.Logger,
-		interval:          interval,
 		advertise:         opts.Advertise,
 		q:                 opts.Queue,
 		matches:           opts.Matches,
@@ -309,14 +334,18 @@ func New(opts Options) *Scheduler {
 		defaultJobLease:   jobLease,
 		userlog:           opts.UserLog,
 		privsep:           opts.Privsep,
-		periodicInterval:  periodic,
-		sysPolicy:         opts.SysPolicy,
 		onJobLeftIdle:     opts.OnJobLeftIdle,
+		stats:             opts.Stats,
+		advReset:          make(chan struct{}, 1),
+		periodicReset:     make(chan struct{}, 1),
 		events:            make(chan Event, 256),
 		advertiseNudge:    make(chan struct{}, 1),
 		running:           map[jobKey]*runInfo{},
 		policyPending:     map[jobKey]bool{},
 	}
+	s.intervalNS.Store(int64(interval))
+	s.periodicNS.Store(int64(periodic))
+	s.sysPolicy.Store(opts.SysPolicy)
 	if opts.PanicJob != "" {
 		var c, p int
 		if n, err := fmt.Sscanf(opts.PanicJob, "%d.%d", &c, &p); n == 2 && err == nil {
@@ -337,6 +366,46 @@ func New(opts Options) *Scheduler {
 	}
 	return s
 }
+
+// advInterval / periodicInterval read the currently configured intervals.
+func (s *Scheduler) advInterval() time.Duration      { return time.Duration(s.intervalNS.Load()) }
+func (s *Scheduler) periodicInterval() time.Duration { return time.Duration(s.periodicNS.Load()) }
+
+// SetAdvertiseInterval retunes the SchedD/Submitter ad refresh interval live
+// (condor_reconfig of SCHEDD_INTERVAL). Non-positive values are ignored. Safe to
+// call from any goroutine; the advertise loop resets its ticker on the next tick.
+func (s *Scheduler) SetAdvertiseInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.intervalNS.Store(int64(d))
+	select {
+	case s.advReset <- struct{}{}:
+	default:
+	}
+}
+
+// SetPeriodicInterval retunes the periodic-policy evaluator interval live
+// (condor_reconfig of PERIODIC_EXPR_INTERVAL). Non-positive values are ignored.
+func (s *Scheduler) SetPeriodicInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.periodicNS.Store(int64(d))
+	select {
+	case s.periodicReset <- struct{}{}:
+	default:
+	}
+}
+
+// SetSysPolicy swaps in a recompiled pool-wide SYSTEM_PERIODIC_* policy live
+// (condor_reconfig). A nil policy clears it. The core and periodic evaluator read
+// the pointer atomically.
+func (s *Scheduler) SetSysPolicy(p *policy.System) { s.sysPolicy.Store(p) }
+
+// ShadowsRunning reports how many jobs the core is currently running (one shadow
+// each). Read from the atomic gauge so it is safe off the core goroutine.
+func (s *Scheduler) ShadowsRunning() int { return int(s.runningGauge.Load()) }
 
 // Submit enqueues an event for the loop. Safe to call from any goroutine.
 func (s *Scheduler) Submit(ev Event) {
@@ -394,6 +463,7 @@ func (s *Scheduler) Drain(grace time.Duration) {
 
 // OnMatch is the callback the NEGOTIATE handler hands each granted match.
 func (s *Scheduler) OnMatch(m negotiate.Match) {
+	s.stats.IncMatchesReceived()
 	s.Submit(evMatch{m})
 }
 
@@ -536,7 +606,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 		sweepC = sweep.C
 	}
 
-	s.log.Info(logging.DestinationGeneral, "scheduler core started", "advertise_interval", s.interval.String())
+	s.log.Info(logging.DestinationGeneral, "scheduler core started", "advertise_interval", s.advInterval().String())
 
 	for {
 		select {
@@ -568,7 +638,7 @@ func (s *Scheduler) advertiseLoop(ctx context.Context) {
 	}
 	s.doAdvertise(ctx)
 
-	ticker := time.NewTicker(s.interval)
+	ticker := time.NewTicker(s.advInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -578,6 +648,11 @@ func (s *Scheduler) advertiseLoop(ctx context.Context) {
 			s.doAdvertise(ctx)
 		case <-s.advertiseNudge:
 			s.doAdvertise(ctx)
+		case <-s.advReset:
+			// SCHEDD_INTERVAL was reconfigured: adopt the new cadence immediately.
+			ticker.Reset(s.advInterval())
+			s.log.Info(logging.DestinationGeneral, "advertise interval reconfigured",
+				"interval", s.advInterval().String())
 		}
 	}
 }
@@ -671,6 +746,7 @@ func (s *Scheduler) handleMatch(ctx context.Context, m negotiate.Match) {
 	runCtx, cancel := context.WithCancel(ctx)
 	detach := &atomic.Bool{}
 	s.running[key] = &runInfo{claimID: m.ClaimID, slotName: m.SlotName, cancel: cancel, detach: detach}
+	s.runningGauge.Add(1)
 	s.log.Info(logging.DestinationGeneral, "claiming slot for job", "job", key.String(), "slot", m.SlotName)
 	go s.runJob(runCtx, m, job, detach)
 }
@@ -876,6 +952,7 @@ func (s *Scheduler) handleStarted(e evStarted) {
 		s.log.Warn(logging.DestinationGeneral, "job vanished before running attrs written", "job", key.String())
 		return
 	}
+	s.stats.IncJobsStarted()
 	// EXECUTE user-log event (like the C++ shadow's logExecuteEvent). Use the
 	// startd's sinful as the execute host (falling back to the slot name), and
 	// pass the slot name as SlotName. Read the flattened ad so UserLog/Iwd
@@ -913,6 +990,7 @@ func (s *Scheduler) handleExited(e evExited) {
 	ri := s.running[key]
 	delete(s.running, key)
 	if ri != nil {
+		s.runningGauge.Add(-1)
 		ri.cancel()
 		s.matches.Remove(ri.claimID)
 		defer s.reapWaiters(ri)
@@ -964,6 +1042,9 @@ func (s *Scheduler) handleExited(e evExited) {
 			"job", key.String(), "err", errStr(e.err))
 	}
 
+	// The shadow reported an exit: the job ran to completion this attempt,
+	// whatever terminal action the policy below selects.
+	s.stats.IncJobsExited()
 	res := e.res
 	now := time.Now().Unix()
 	s.q.Modify(e.c, e.p, func(ad *classad.ClassAd) {
@@ -1005,7 +1086,7 @@ func (s *Scheduler) handleExited(e evExited) {
 	d := policy.Decision{Action: policy.Complete}
 	if ad, ok := s.q.Get(e.c, e.p); ok {
 		_ = ad.Set("CurrentTime", now)
-		d = policy.Analyze(ad, policy.PeriodicThenExit, s.sysPolicy, queue.StatusRunning)
+		d = policy.Analyze(ad, policy.PeriodicThenExit, s.sysPolicy.Load(), queue.StatusRunning)
 	}
 	code, _ := res.ExitCode()
 
@@ -1048,6 +1129,7 @@ func (s *Scheduler) handleExited(e evExited) {
 			}
 		}
 		s.q.Complete(e.c, e.p)
+		s.stats.IncJobsCompleted()
 		s.log.Info(logging.DestinationGeneral, "job completed",
 			"job", key.String(), "exit_code", code, "reason", res.Reason)
 	}
@@ -1114,6 +1196,7 @@ func (s *Scheduler) handleFailed(e evFailed) {
 	key := jobKey{e.c, e.p}
 	ri, ok := s.running[key]
 	if ok {
+		s.runningGauge.Add(-1)
 		ri.cancel()
 		delete(s.running, key)
 		defer s.reapWaiters(ri)
@@ -1179,6 +1262,7 @@ func (s *Scheduler) jobFailed(c, p int, why string, count bool) {
 		_ = ad.Set("LastJobStatus", int64(queue.StatusRunning))
 		_ = ad.Set("EnteredCurrentStatus", now)
 		if count {
+			s.stats.IncShadowExceptions()
 			excepts, _ = ad.EvaluateAttrInt("NumShadowExceptions")
 			excepts++
 			_ = ad.Set("NumShadowExceptions", excepts)
@@ -1388,6 +1472,7 @@ func (s *Scheduler) handleRecover(ctx context.Context, e evRecover) {
 			detach:    &atomic.Bool{},
 			reconnect: true,
 		}
+		s.runningGauge.Add(1)
 		s.log.Info(logging.DestinationGeneral, "reconnecting to running job",
 			"job", key.String(), "slot", r.slotName)
 		// JOB_DISCONNECTED user-log event (like the C++ shadow's
@@ -1480,6 +1565,7 @@ func (s *Scheduler) handleReconnectFailed(e evReconnectFailed) {
 	key := jobKey{e.c, e.p}
 	ri, ok := s.running[key]
 	if ok {
+		s.runningGauge.Add(-1)
 		ri.cancel()
 		delete(s.running, key)
 		defer s.reapWaiters(ri)
@@ -1526,16 +1612,21 @@ const policyActor = "condor_schedd"
 // Scheduler::PeriodicExprHandler / WalkJobQueue(PeriodicExprEval).
 func (s *Scheduler) periodicLoop(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(s.periodicInterval)
+	ticker := time.NewTicker(s.periodicInterval())
 	defer ticker.Stop()
 	s.log.Info(logging.DestinationGeneral, "periodic-policy evaluator started",
-		"interval", s.periodicInterval.String())
+		"interval", s.periodicInterval().String())
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.evaluatePeriodic()
+		case <-s.periodicReset:
+			// PERIODIC_EXPR_INTERVAL was reconfigured: adopt the new cadence.
+			ticker.Reset(s.periodicInterval())
+			s.log.Info(logging.DestinationGeneral, "periodic-policy interval reconfigured",
+				"interval", s.periodicInterval().String())
 		}
 	}
 }
@@ -1550,7 +1641,8 @@ func (s *Scheduler) periodicLoop(ctx context.Context) {
 // job every tick. Not prematurely optimized here (see ROADMAP scale note).
 func (s *Scheduler) evaluatePeriodic() {
 	now := time.Now().Unix()
-	haveSys := !s.sysPolicy.Empty()
+	sysPolicy := s.sysPolicy.Load()
+	haveSys := !sysPolicy.Empty()
 	for shared := range s.q.Scan() {
 		// Only Idle/Running/Held jobs live in the queue (terminal jobs are
 		// archived out); skip anything without a candidate expression fast.
@@ -1566,7 +1658,7 @@ func (s *Scheduler) evaluatePeriodic() {
 		_ = ad.Set("CurrentTime", now)
 		c, _ := ad.EvaluateAttrInt("ClusterId")
 		p, _ := ad.EvaluateAttrInt("ProcId")
-		d := policy.Analyze(ad, policy.PeriodicOnly, s.sysPolicy, state)
+		d := policy.Analyze(ad, policy.PeriodicOnly, sysPolicy, state)
 		switch d.Action {
 		case policy.Remove:
 			s.Submit(evPolicyRemove{int(c), int(p), d.Reason})

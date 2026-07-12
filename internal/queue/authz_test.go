@@ -240,3 +240,42 @@ func TestAuthzAllUsersTrusted(t *testing.T) {
 		t.Fatalf("all-trusted immutable edit: want AuthzError, got %v", err)
 	}
 }
+
+// TestSetAuthzLiveReconfig proves Queue.SetAuthz (the condor_reconfig path)
+// promotes a new QUEUE_SUPER_USER and adds a new immutable attribute at runtime,
+// and that both take effect for transactions begun after the reconfig.
+func TestSetAuthzLiveReconfig(t *testing.T) {
+	q := openAuthzQueue(t, Options{SuperUsers: []string{"condor", "root"}})
+	defer q.Close()
+	c := submitCluster(t, q, "alice", 1)
+
+	// Before reconfig: "carol" is not a superuser, so she cannot edit alice's job.
+	if !q.IsSuperUser("condor") || q.IsSuperUser("carol") {
+		t.Fatalf("pre-reconfig super set unexpected")
+	}
+	if err := q.Begin("carol").SetAttribute(c, 0, "Foo", `"x"`); !isAuthzErr(err) {
+		t.Fatalf("carol editing alice's job before promotion: want AuthzError, got %v", err)
+	}
+
+	// Reconfigure: promote carol to a super user and mark "LockMe" immutable.
+	q.SetAuthz(Options{
+		SuperUsers:     []string{"condor", "root", "carol"},
+		ImmutableAttrs: []string{"LockMe"},
+	})
+
+	if !q.IsSuperUser("carol") {
+		t.Fatalf("carol not a super user after SetAuthz")
+	}
+	// carol (now super) may edit alice's job.
+	txn := q.Begin("carol")
+	if err := txn.SetAttribute(c, 0, "Foo", `"x"`); err != nil {
+		t.Fatalf("promoted carol editing alice's job: %v", err)
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// The newly-immutable attribute is now rejected for everyone, including supers.
+	if err := q.Begin("condor").SetAttribute(c, 0, "LockMe", `"y"`); !isAuthzErr(err) {
+		t.Fatalf("setting newly-immutable attr after reconfig: want AuthzError, got %v", err)
+	}
+}

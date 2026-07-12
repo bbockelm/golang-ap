@@ -39,6 +39,25 @@ func resolveSpoolDir(cfg *config.Config) string {
 func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.Queue, error) {
 	spool := resolveSpoolDir(cfg)
 	uidDomain, _ := cfg.Get("UID_DOMAIN")
+	opts := queueAuthzOptions(cfg)
+	opts.Dir = strings.TrimSpace(spool)
+	opts.ScheddName = name
+	opts.UIDDomain = strings.TrimSpace(uidDomain)
+	q, err := queue.Open(opts)
+	if err != nil {
+		return nil, err
+	}
+	log.Info(logging.DestinationGeneral, "job queue opened", "spool", spool, "jobs", q.Counts().Total)
+	return q, nil
+}
+
+// queueAuthzOptions reads the QMGMT-authorization knobs (QUEUE_SUPER_USERS, the
+// *_JOB_ATTRS lists, and the trust toggles) into a queue.Options. It is shared by
+// openJobQueue at startup and by the condor_reconfig callback (Queue.SetAuthz), so
+// both build the authorization set identically. The SYSTEM_* attribute defaults are
+// baked into the queue; these knobs add operator extras and the trust flags,
+// mirroring the C++ schedd's config.
+func queueAuthzOptions(cfg *config.Config) queue.Options {
 	supers := []string{"condor", "root"}
 	if v, ok := cfg.Get("QUEUE_SUPER_USERS"); ok {
 		for _, s := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
@@ -47,25 +66,14 @@ func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.
 			}
 		}
 	}
-	q, err := queue.Open(queue.Options{
-		Dir:        strings.TrimSpace(spool),
-		ScheddName: name,
-		UIDDomain:  strings.TrimSpace(uidDomain),
-		SuperUsers: supers,
-		// Per-attribute QMGMT authorization (see internal/queue/authz.go): the
-		// SYSTEM_* defaults are baked in; these knobs add operator extras and the
-		// trust toggles, mirroring the C++ schedd's config.
+	return queue.Options{
+		SuperUsers:        supers,
 		ImmutableAttrs:    attrList(cfg, "IMMUTABLE_JOB_ATTRS"),
 		ProtectedAttrs:    attrList(cfg, "PROTECTED_JOB_ATTRS"),
 		SecureAttrs:       attrList(cfg, "SECURE_JOB_ATTRS"),
 		AllUsersTrusted:   configBool(cfg, "QUEUE_ALL_USERS_TRUSTED", false),
 		IgnoreSecureAttrs: configBool(cfg, "IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS", true),
-	})
-	if err != nil {
-		return nil, err
 	}
-	log.Info(logging.DestinationGeneral, "job queue opened", "spool", spool, "jobs", q.Counts().Total)
-	return q, nil
 }
 
 // attrList splits a comma/space/tab-separated HTCondor attribute-list config

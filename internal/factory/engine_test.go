@@ -5,11 +5,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
+	"github.com/bbockelm/golang-ap/internal/stats"
 )
 
 func testLogger(t *testing.T) *logging.Logger {
@@ -142,5 +144,40 @@ func TestEngineLazyMaterialization(t *testing.T) {
 	// Factory marked done.
 	if fi, ok := q.FactoryInfo(c); ok && fi.Paused == 0 {
 		t.Errorf("factory not marked paused/done after materializing all rows")
+	}
+}
+
+// TestEngineSetIntervalAndStats verifies the live-reconfig interval setter
+// (SCHEDD_MATERIALIZE_INTERVAL) and that materialized procs are counted into the
+// stats collector.
+func TestEngineSetIntervalAndStats(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.Open(queue.Options{Dir: dir, ScheddName: "s", UIDDomain: "d"})
+	if err != nil {
+		t.Fatalf("queue.Open: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	eng := NewEngine(q, testLogger(t), 5*time.Second)
+	if got := eng.interval(); got != 5*time.Second {
+		t.Fatalf("initial interval = %v, want 5s", got)
+	}
+	// Live retune; non-positive is ignored.
+	eng.SetInterval(90 * time.Second)
+	if got := eng.interval(); got != 90*time.Second {
+		t.Fatalf("after SetInterval = %v, want 90s", got)
+	}
+	eng.SetInterval(0)
+	if got := eng.interval(); got != 90*time.Second {
+		t.Fatalf("SetInterval(0) changed interval to %v, want 90s unchanged", got)
+	}
+
+	sc := stats.New()
+	eng.SetStats(sc)
+	// A "queue 4" factory: 4 procs, all materialized at once (maxIdle unbounded).
+	c := setupFactory(t, q, dir, "arguments=run $(Process)\n\nQueue 4\n", nil, -1, 0)
+	eng.materializeCluster(c)
+	if got := sc.Snapshot().JobsMaterialized; got != 4 {
+		t.Fatalf("JobsMaterialized = %d, want 4", got)
 	}
 }

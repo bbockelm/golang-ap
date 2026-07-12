@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
+	"github.com/bbockelm/golang-ap/internal/stats"
 )
 
 // DefaultInterval is how often the materialization engine sweeps factories even
@@ -24,10 +26,15 @@ const DefaultInterval = 5 * time.Second
 // serialized per cluster). Mirrors the C++ schedd's JobMaterializeTimerCallback /
 // MaterializeJobs loop.
 type Engine struct {
-	q        *queue.Queue
-	log      *logging.Logger
-	interval time.Duration
-	nudge    chan struct{}
+	q   *queue.Queue
+	log *logging.Logger
+	// intervalNS is the backstop sweep interval as a nanosecond atomic so
+	// condor_reconfig of SCHEDD_MATERIALIZE_INTERVAL can retune it live (SetInterval
+	// stores the new value and signals reset; Run resets its ticker).
+	intervalNS atomic.Int64
+	nudge      chan struct{}
+	reset      chan struct{}
+	stats      *stats.Collector
 
 	mu    sync.Mutex
 	cache map[int]*factoryCache // parsed digest + item rows, keyed by cluster
@@ -44,14 +51,36 @@ func NewEngine(q *queue.Queue, log *logging.Logger, interval time.Duration) *Eng
 	if interval <= 0 {
 		interval = DefaultInterval
 	}
-	return &Engine{
-		q:        q,
-		log:      log,
-		interval: interval,
-		nudge:    make(chan struct{}, 1),
-		cache:    map[int]*factoryCache{},
+	e := &Engine{
+		q:     q,
+		log:   log,
+		nudge: make(chan struct{}, 1),
+		reset: make(chan struct{}, 1),
+		cache: map[int]*factoryCache{},
+	}
+	e.intervalNS.Store(int64(interval))
+	return e
+}
+
+// SetStats wires the stats collector so materialized procs are counted
+// (JobsMaterialized). nil-safe.
+func (e *Engine) SetStats(s *stats.Collector) { e.stats = s }
+
+// SetInterval retunes the backstop sweep interval live (condor_reconfig of
+// SCHEDD_MATERIALIZE_INTERVAL). Non-positive values are ignored. Safe from any
+// goroutine; Run adopts the new cadence on its next loop.
+func (e *Engine) SetInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	e.intervalNS.Store(int64(d))
+	select {
+	case e.reset <- struct{}{}:
+	default:
 	}
 }
+
+func (e *Engine) interval() time.Duration { return time.Duration(e.intervalNS.Load()) }
 
 // Nudge asks the engine to sweep promptly. Non-blocking and safe from any
 // goroutine (e.g. the scheduler core on a job start/exit); coalesces with a
@@ -67,10 +96,10 @@ func (e *Engine) Nudge() {
 // goroutine). It sweeps once immediately so a factory submitted while the engine
 // was idle materializes its first batch without waiting a full interval.
 func (e *Engine) Run(ctx context.Context) {
-	ticker := time.NewTicker(e.interval)
+	ticker := time.NewTicker(e.interval())
 	defer ticker.Stop()
 	e.log.Info(logging.DestinationGeneral, "late-materialization engine started",
-		"interval", e.interval.String())
+		"interval", e.interval().String())
 	e.sweep()
 	for {
 		select {
@@ -80,6 +109,11 @@ func (e *Engine) Run(ctx context.Context) {
 			e.sweep()
 		case <-e.nudge:
 			e.sweep()
+		case <-e.reset:
+			// SCHEDD_MATERIALIZE_INTERVAL was reconfigured: adopt the new cadence.
+			ticker.Reset(e.interval())
+			e.log.Info(logging.DestinationGeneral, "materialize interval reconfigured",
+				"interval", e.interval().String())
 		}
 	}
 }
@@ -166,6 +200,7 @@ func (e *Engine) materializeCluster(c int) {
 		materialized++
 	}
 	if materialized > 0 {
+		e.stats.AddJobsMaterialized(materialized)
 		e.log.Info(logging.DestinationGeneral, "materialized factory procs",
 			"cluster", c, "count", materialized, "next_proc", next, "limit", limit, "idle", idle)
 	}

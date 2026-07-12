@@ -15,6 +15,8 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/logging"
 	"github.com/bbockelm/golang-htcondor/version"
+
+	"github.com/bbockelm/golang-ap/internal/stats"
 )
 
 // Advertiser builds and sends the SchedD ad. It is constructed once at startup
@@ -43,8 +45,11 @@ type Advertiser struct {
 	// one UPDATE_SUBMITTOR_AD per submitter each round so the negotiator will
 	// negotiate for them (a submitter ad is the prerequisite for NEGOTIATE).
 	submittersFn func() []Submitter
-	seq          int64
-	submitSeq    int64
+	// statsFn, if set, supplies the schedd's runtime statistics snapshot for the
+	// enriched Scheduler-ad stat attributes (JobsStarted, ShadowsRunning, ...).
+	statsFn   func() stats.Snapshot
+	seq       int64
+	submitSeq int64
 }
 
 // QueueCounts carries the live job-queue tallies published in the Scheduler ad.
@@ -76,6 +81,9 @@ type Options struct {
 	CountsFn func() QueueCounts
 	// SubmittersFn, if set, supplies per-submitter tallies each advertise round.
 	SubmittersFn func() []Submitter
+	// StatsFn, if set, supplies the runtime statistics snapshot published as the
+	// enriched Scheduler-ad stat attributes.
+	StatsFn func() stats.Snapshot
 }
 
 // New builds an Advertiser.
@@ -90,6 +98,7 @@ func New(opts Options) *Advertiser {
 		addrFn:       opts.AddressFn,
 		countsFn:     opts.CountsFn,
 		submittersFn: opts.SubmittersFn,
+		statsFn:      opts.StatsFn,
 	}
 }
 
@@ -205,7 +214,40 @@ func (a *Advertiser) buildAd() *classad.ClassAd {
 	_ = ad.Set("NumUsers", counts.Users)
 	_ = ad.Set("MaxJobsRunning", a.maxJobs)
 	_ = ad.Set("StartSchedulerUniverse", false)
+	a.setStatAttrs(ad)
 	return ad
+}
+
+// setStatAttrs adds the ScheddStatistics attributes from the runtime stats
+// snapshot to the Scheduler ad. The attribute NAMES mirror the C++
+// ScheddStatistics (schedd_stats.cpp) so condor_status -schedd -long and pool
+// monitoring recognize them:
+//
+//	JobsStarted        - runs that entered Running (a shadow started)
+//	JobsExited         - runs whose shadow reported an exit
+//	JobsCompleted      - jobs that terminated normally and left the queue
+//	ShadowExceptions   - abnormal run failures charged against a job
+//	ShadowsRunning     - shadows currently running (an abs gauge in C++)
+//	JobsMaterialized   - proc ads produced by job factories (late materialization)
+//
+// It also republishes RecentDaemonCoreDutyCycle as 0.0 (we do not measure a duty
+// cycle) is intentionally omitted -- we do not fabricate values we do not track.
+// ScheddUptime is a plain seconds-since-start gauge (DaemonStartTime, already on
+// the ad, carries the absolute start time).
+func (a *Advertiser) setStatAttrs(ad *classad.ClassAd) {
+	if a.statsFn == nil {
+		return
+	}
+	s := a.statsFn()
+	_ = ad.Set("JobsStarted", s.JobsStarted)
+	_ = ad.Set("JobsExited", s.JobsExited)
+	_ = ad.Set("JobsCompleted", s.JobsCompleted)
+	_ = ad.Set("ShadowExceptions", s.ShadowExceptions)
+	_ = ad.Set("ShadowsRunning", s.ShadowsRunning)
+	_ = ad.Set("JobsMaterialized", s.JobsMaterialized)
+	_ = ad.Set("MatchesReceived", s.MatchesReceived)
+	_ = ad.Set("NegotiationCycles", s.NegotiationCycles)
+	_ = ad.Set("ScheddUptime", s.UptimeSeconds)
 }
 
 // condorVersionString renders the "$CondorVersion: ... $" banner the pool uses

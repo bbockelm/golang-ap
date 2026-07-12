@@ -49,6 +49,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
+	"github.com/bbockelm/golang-ap/internal/stats"
 )
 
 // HTCondor resource-request / diagnostic attribute names (condor_attributes.h).
@@ -87,6 +88,7 @@ type Handler struct {
 	q       *queue.Queue
 	log     *logging.Logger
 	onMatch func(Match)
+	stats   *stats.Collector
 }
 
 // New builds a NEGOTIATE handler. onMatch is invoked (from the handler goroutine)
@@ -94,6 +96,10 @@ type Handler struct {
 func New(q *queue.Queue, log *logging.Logger, onMatch func(Match)) *Handler {
 	return &Handler{q: q, log: log, onMatch: onMatch}
 }
+
+// SetStats wires the stats collector so each negotiation round the schedd handles
+// is counted (NegotiationCycles). nil-safe.
+func (h *Handler) SetStats(s *stats.Collector) { h.stats = s }
 
 // groupState tracks one offered resource-request group for the duration of a
 // round: its jobs in priority order, how many have been assigned to matches, and
@@ -139,6 +145,7 @@ func (h *Handler) Handle(ctx context.Context, c *cedarserver.Conn) error {
 		return fmt.Errorf("negotiate: header missing Owner (submitter)")
 	}
 	projection := buildProjection(header)
+	h.stats.IncNegotiationCycles()
 	h.log.Info(logging.DestinationGeneral, "NEGOTIATE started",
 		"submitter", owner, "remote", c.RemoteAddr, "sig_attrs", strings.Join(projection, ","))
 
