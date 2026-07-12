@@ -232,10 +232,54 @@ func stripRunAttrs(ad *classad.ClassAd) {
 // archiveAndDelete appends the flattened ad to history, then removes the job
 // from the live queue. Append-then-delete: a crash between the two leaves a
 // duplicate in history rather than losing the record.
+//
+// NB: this runs ON the single-writer scheduler core for a completing job
+// (q.Complete). It deliberately does NOT reclaim an exhausted factory's cluster
+// ad here: doing so required a full O(N) chained-collection live-proc scan
+// (clusterProcCounts) per completion on the core. Factory-cluster reclamation
+// now happens off the core, in the materialization engine's sweep
+// (MaybeCleanupFactoryCluster), which is nudged when a job leaves the queue --
+// keeping the core's completion path cheap.
 func (q *Queue) archiveAndDelete(c, p int, ad *classad.ClassAd) {
 	_ = q.hist.Append(ad)
 	_ = q.hist.Flush()
 	q.coll.Delete(jobKey(c, p))
+}
+
+// MaybeCleanupFactoryCluster removes an exhausted factory's cluster ad once its
+// last materialized proc has left the queue, and drops it from the factory set,
+// so the materialization engine stops visiting it (mirrors the C++ schedd's
+// ClusterCleanup for a fully-materialized factory). Non-factory cluster ads are
+// left untouched. Called OFF the scheduler core, from the materialization engine
+// sweep, so the O(N) live-proc scan (FactoryInfo) never runs on the core.
+// It returns true iff it removed the factory (so a caller can drop any per-cluster
+// cache).
+func (q *Queue) MaybeCleanupFactoryCluster(c int) bool {
+	if !q.IsFactoryCluster(c) {
+		return false
+	}
+	fi, ok := q.FactoryInfo(c)
+	if !ok || fi.TotalProcs > 0 {
+		return false
+	}
+	// No procs remain. Only reclaim once the factory can produce no more (paused
+	// or every row/limit consumed); an in-flight factory momentarily at zero
+	// procs must keep its cluster ad so materialization can continue.
+	done := fi.Paused != 0
+	if lim := fi.Limit; lim > 0 && fi.NextProcId >= lim {
+		done = true
+	}
+	if fi.ItemCount > 0 && fi.NextRow >= fi.ItemCount && fi.NextProcId >= fi.NextRow {
+		done = true
+	}
+	if !done {
+		return false
+	}
+	q.factoryMu.Lock()
+	q.coll.Delete(jobKey(c, -1))
+	q.factoryMu.Unlock()
+	q.unnoteFactory(c)
+	return true
 }
 
 // Complete moves a job to Completed and archives it (used by the scheduler core

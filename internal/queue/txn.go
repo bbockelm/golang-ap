@@ -33,6 +33,10 @@ type Txn struct {
 // fail the commit.
 func (t *Txn) AddError(msg string) { t.errs = append(t.errs, msg) }
 
+// ActiveCluster returns the transaction's active cluster (the one NewProc /
+// SetJobFactory target), or -1 if none. Mirrors qmgmt.cpp active_cluster_num.
+func (t *Txn) ActiveCluster() int { return t.active }
+
 // SetEffectiveOwner changes the owner for jobs created in this transaction. Only
 // honored for super users (non-supers are pinned to their authenticated user),
 // matching QmgmtSetEffectiveOwner.
@@ -222,6 +226,22 @@ func (t *Txn) Commit() error {
 	}
 	for key := range t.destroyed {
 		t.q.coll.Delete([]byte(key))
+		// A destroyed cluster ad drops the cluster from the factory set.
+		if c, p, ok := parseJobKey([]byte(key)); ok && p < 0 {
+			t.q.unnoteFactory(c)
+		}
+	}
+	// Register any newly-committed factory cluster (its cluster ad now carries a
+	// digest file), so the materialization engine picks it up.
+	for key, ad := range t.pending {
+		if t.destroyed[key] {
+			continue
+		}
+		if c, p, ok := parseJobKey([]byte(key)); ok && p < 0 {
+			if s, ok := ad.EvaluateAttrString(AttrMaterializeDigestFile); ok && s != "" {
+				t.q.noteFactory(c)
+			}
+		}
 	}
 	// SUBMIT user-log event: the C++ schedd writes it at commit of a new proc
 	// (qmgmt.cpp CommitTransaction -> WriteSubmitToUserLog), not condor_submit.

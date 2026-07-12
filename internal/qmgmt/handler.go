@@ -11,6 +11,10 @@ package qmgmt
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -19,6 +23,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 	hqmgmt "github.com/bbockelm/golang-htcondor/qmgmt"
 
+	"github.com/bbockelm/golang-ap/internal/factory"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -32,20 +37,22 @@ const (
 
 // Server dispatches QMGMT operations against a job queue.
 type Server struct {
-	q    *queue.Queue
-	log  *logging.Logger
-	caps *classad.ClassAd
+	q        *queue.Queue
+	log      *logging.Logger
+	caps     *classad.ClassAd
+	spoolDir string // $(SPOOL): where factory digests/itemdata are stored
 }
 
-// New builds a QMGMT server bound to the given queue.
-func New(q *queue.Queue, log *logging.Logger) *Server {
+// New builds a QMGMT server bound to the given queue. spoolDir is $(SPOOL); it is
+// where late-materialization digest/itemdata files are written.
+func New(q *queue.Queue, log *logging.Logger, spoolDir string) *Server {
 	caps := classad.New()
-	// Attributes copied from GetSchedulerCapabilities (qmgmt.cpp). This schedd
-	// does not (yet) support late materialization or jobsets.
-	_ = caps.Set("LateMaterialize", false)
+	// Attributes copied from GetSchedulerCapabilities (qmgmt.cpp). Late
+	// materialization (job factories) is supported; jobsets are not.
+	_ = caps.Set("LateMaterialize", true)
 	_ = caps.Set("LateMaterializeVersion", int64(2))
 	_ = caps.Set("UseJobsets", false)
-	return &Server{q: q, log: log, caps: caps}
+	return &Server{q: q, log: log, caps: caps, spoolDir: spoolDir}
 }
 
 // Handle runs the QMGMT RPC loop for one connection. It is registered for both
@@ -363,16 +370,158 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 				return err
 			}
 
+		case hqmgmt.OpSetJobFactory, hqmgmt.OpSetMaterializeData:
+			// SetJobFactory(cluster, num, filename, digest_text). Read order and
+			// reply verified against qmgmt_receivers.cpp CONDOR_SetJobFactory:
+			// code(cluster); code(num); code(filename); code(text); reply
+			// code(rval); if rval<0 code(terrno). num is max_materialize ->
+			// JobMaterializeLimit. The obsolete CONDOR_SetMaterializeData shares
+			// the arg shape but is rejected with EPERM.
+			cluster, e1 := rm.GetInt(ctx)
+			num, e2 := rm.GetInt(ctx)
+			_, e3 := rm.GetString(ctx) // filename (legacy/unused; schedd picks the spool path)
+			text, e4 := rm.GetString(ctx)
+			if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+				return nil
+			}
+			if op == hqmgmt.OpSetMaterializeData {
+				_ = s.reply(ctx, c, -1, ePERM) // obsolete op
+				continue
+			}
+			if !writable {
+				_ = s.reply(ctx, c, -1, ePERM)
+				continue
+			}
+			if cluster != txn.ActiveCluster() {
+				_ = s.reply(ctx, c, -1, ePERM)
+				continue
+			}
+			if err := s.setJobFactory(txn, cluster, num, text); err != nil {
+				s.log.Warn(logging.DestinationGeneral, "SetJobFactory failed", "cluster", cluster, "err", err)
+				_ = s.reply(ctx, c, -1, eINVAL)
+				continue
+			}
+			if err := s.reply(ctx, c, 0, 0); err != nil {
+				return err
+			}
+
+		case hqmgmt.OpSendMaterializeData:
+			// SendMaterializeData(cluster, flags, <itemdata bytes until EOM>).
+			// Reply verified against CONDOR_SendMaterializeData: code(filename);
+			// code(row_count); code(rval); if rval<0 code(terrno).
+			cluster, e1 := rm.GetInt(ctx)
+			_, e2 := rm.GetInt(ctx) // flags (submit sends 0)
+			data, e3 := rm.GetRemainingBytes(ctx)
+			if e1 != nil || e2 != nil || e3 != nil {
+				return nil
+			}
+			if !writable || cluster != txn.ActiveCluster() {
+				if err := s.replyMaterializeData(ctx, c, "", 0, -1, ePERM); err != nil {
+					return err
+				}
+				continue
+			}
+			path, count, err := s.sendMaterializeData(txn, cluster, data)
+			if err != nil {
+				s.log.Warn(logging.DestinationGeneral, "SendMaterializeData failed", "cluster", cluster, "err", err)
+				if err := s.replyMaterializeData(ctx, c, "", 0, -1, eINVAL); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := s.replyMaterializeData(ctx, c, path, count, 0, 0); err != nil {
+				return err
+			}
+
 		default:
-			// Any other op (SetJobFactory, SendMaterializeData, jobsets, ...):
-			// we cannot safely read unknown argument shapes, so end the
-			// connection cleanly rather than risk desyncing the stream.
+			// Any other op (jobsets SendJobQueueAd 10040, ...): we cannot safely
+			// read unknown argument shapes, so end the connection cleanly rather
+			// than risk desyncing the stream. UseJobsets=false keeps modern
+			// condor_submit from sending these.
 			s.log.Warn(logging.DestinationGeneral, "unsupported QMGMT op; closing connection", "op", op)
 			txn.Abort()
 			return nil
 		}
 	}
 }
+
+// setJobFactory stores the submit digest to the spool and stages the factory
+// bookkeeping on the cluster ad (proc -1) in the current transaction, so it
+// commits atomically with the rest of the submit. Mirrors
+// QmgmtHandleSetJobFactory (qmgmt.cpp): num -> JobMaterializeLimit, the digest
+// text -> $(SPOOL)/<c%10000>/condor_submit.<c>.digest -> JobMaterializeDigestFile,
+// and NextProcId/NextRow/Paused initialized to 0.
+func (s *Server) setJobFactory(txn *queue.Txn, cluster, num int, digest string) error {
+	path := factory.SpooledDigestPath(s.spoolDir, cluster)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(digest), 0o644); err != nil {
+		return err
+	}
+	set := func(name, expr string) error { return txn.SetAttribute(cluster, -1, name, expr) }
+	if err := set(queue.AttrMaterializeLimit, strconv.Itoa(num)); err != nil {
+		return err
+	}
+	if err := set(queue.AttrMaterializeDigestFile, strconv.Quote(path)); err != nil {
+		return err
+	}
+	if err := set(queue.AttrMaterializeNextProcId, "0"); err != nil {
+		return err
+	}
+	if err := set(queue.AttrMaterializeNextRow, "0"); err != nil {
+		return err
+	}
+	if err := set(queue.AttrMaterializePaused, "0"); err != nil {
+		return err
+	}
+	return set(queue.AttrMaterializeDate, strconv.FormatInt(nowUnix(), 10))
+}
+
+// sendMaterializeData stores the streamed itemdata to the spool and stages the
+// itemdata file + row count on the cluster ad. Returns the spool path and row
+// count for the reply. Mirrors QmgmtHandleSendMaterializeData (qmgmt.cpp).
+func (s *Server) sendMaterializeData(txn *queue.Txn, cluster int, data []byte) (string, int, error) {
+	path := factory.SpooledItemsPath(s.spoolDir, cluster)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", 0, err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", 0, err
+	}
+	count := len(factory.ParseItems(data))
+	if err := txn.SetAttribute(cluster, -1, queue.AttrMaterializeItemsFile, strconv.Quote(path)); err != nil {
+		return "", 0, err
+	}
+	if err := txn.SetAttribute(cluster, -1, queue.AttrMaterializeItemCount, strconv.Itoa(count)); err != nil {
+		return "", 0, err
+	}
+	return path, count, nil
+}
+
+// replyMaterializeData writes the SendMaterializeData reply: filename, row_count,
+// rval, and terrno when rval < 0 (qmgmt_receivers.cpp CONDOR_SendMaterializeData).
+func (s *Server) replyMaterializeData(ctx context.Context, c *cedarserver.Conn, filename string, count, rval, terrno int) error {
+	wm := message.NewMessageForStream(c.Stream)
+	if err := wm.PutString(ctx, filename); err != nil {
+		return err
+	}
+	if err := wm.PutInt(ctx, count); err != nil {
+		return err
+	}
+	if err := wm.PutInt(ctx, rval); err != nil {
+		return err
+	}
+	if rval < 0 {
+		if err := wm.PutInt(ctx, terrno); err != nil {
+			return err
+		}
+	}
+	return wm.FinishMessage(ctx)
+}
+
+// nowUnix is a var so tests can pin time.
+var nowUnix = func() int64 { return time.Now().Unix() }
 
 // reply writes a standard rval [+terrno] reply and finishes the message.
 func (s *Server) reply(ctx context.Context, c *cedarserver.Conn, rval, terrno int) error {

@@ -206,6 +206,14 @@ type Config struct {
 	// which for a personal/unprivileged AP runs as the current user -- identical
 	// to the pre-privsep behavior.
 	Privsep droppriv.Privsep
+
+	// ForceWinddownFail is a TEST HOOK: when true, the shadow reports a claim
+	// wind-down failure even after the job exited cleanly, exercising the path
+	// where a finished job's best-effort JOB_DONE/RELEASE_CLAIM to the startd
+	// fails under load. Used by the HTCONDOR-3828 regression test to prove a
+	// completed job is still completed (not requeued/held) despite a wind-down
+	// error. Never set in production.
+	ForceWinddownFail bool
 }
 
 // Shadow serves one starter over one activated-claim connection. Create it
@@ -331,6 +339,11 @@ func (s *Shadow) afterServe(ctx context.Context, serveErr error) (*Result, error
 	}
 	if !gotExit {
 		return nil, fmt.Errorf("shadow: serve loop ended without a job_exit")
+	}
+	if windErr == nil && s.cfg.ForceWinddownFail {
+		// TEST HOOK (HTCONDOR-3828): pretend the claim wind-down failed even though
+		// the job exited cleanly, so the caller sees (result, error).
+		windErr = fmt.Errorf("forced wind-down failure (test hook)")
 	}
 	if windErr != nil {
 		return &res, fmt.Errorf("shadow: job finished but claim wind-down failed: %w", windErr)

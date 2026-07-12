@@ -62,8 +62,8 @@ func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.
 
 // registerQueueCommands registers the Stage 5 job-queue command handlers:
 // QMGMT read/write, the condor_q query commands, and ACT_ON_JOBS.
-func registerQueueCommands(srv *cedarserver.Server, q *queue.Queue, log *logging.Logger) {
-	qm := qmgmt.New(q, log)
+func registerQueueCommands(srv *cedarserver.Server, q *queue.Queue, log *logging.Logger, spoolDir string) {
+	qm := qmgmt.New(q, log, spoolDir)
 	// QMGMT_WRITE_CMD forces authentication (the queue needs the submitting
 	// user); registered at WRITE like the C++ schedd. The read variant serves
 	// tools that only read the queue.

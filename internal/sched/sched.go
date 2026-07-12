@@ -132,6 +132,13 @@ type Options struct {
 	// panic/requeue policy end-to-end. Empty disables the hook.
 	PanicJob string
 
+	// WinddownFailJob is a test hook ("cluster.proc"): every shadow run for that
+	// job reports a claim wind-down failure after the job exits cleanly, so the
+	// core sees a completed job whose best-effort claim release failed. Proves
+	// (HTCONDOR-3828) such a job is still completed, not requeued/held. Empty
+	// disables the hook.
+	WinddownFailJob string
+
 	// ReconnectDisabled turns off shadow/claim reconnect (SCHEDD_RECONNECT=false):
 	// running jobs are requeued to Idle on shutdown (the old drain behavior) and
 	// no startup recovery is attempted. Default (false) keeps the C++-faithful
@@ -160,6 +167,12 @@ type Options struct {
 	// _SUBCODE) expressions applied to every job in addition to its own
 	// Periodic* expressions. nil (the default) means no system policy.
 	SysPolicy *policy.System
+
+	// OnJobLeftIdle, if set, is invoked (non-blocking) whenever a job leaves the
+	// Idle state -- it starts running or terminates -- so the late-materialization
+	// engine can promptly top up a factory back to max_idle. nil disables the
+	// nudge (the engine still runs on its own timer).
+	OnJobLeftIdle func()
 }
 
 // jobKey identifies a job proc.
@@ -218,6 +231,7 @@ type Scheduler struct {
 
 	periodicInterval time.Duration
 	sysPolicy        *policy.System
+	onJobLeftIdle    func()
 
 	events chan Event
 	// advertiseNudge asks the (separate) advertiser goroutine to push ads now,
@@ -239,6 +253,11 @@ type Scheduler struct {
 	panicMu    sync.Mutex
 	panicJob   jobKey
 	panicArmed bool
+
+	// winddownFailJob/-Armed: test hook forcing a claim wind-down failure for a
+	// finished job (HTCONDOR-3828 regression). See Options.WinddownFailJob.
+	winddownFailJob   jobKey
+	winddownFailArmed bool
 
 	cancel   context.CancelFunc
 	stopOnce sync.Once
@@ -292,6 +311,7 @@ func New(opts Options) *Scheduler {
 		privsep:           opts.Privsep,
 		periodicInterval:  periodic,
 		sysPolicy:         opts.SysPolicy,
+		onJobLeftIdle:     opts.OnJobLeftIdle,
 		events:            make(chan Event, 256),
 		advertiseNudge:    make(chan struct{}, 1),
 		running:           map[jobKey]*runInfo{},
@@ -306,6 +326,15 @@ func New(opts Options) *Scheduler {
 				"shadow panic test hook armed", "job", s.panicJob.String())
 		}
 	}
+	if opts.WinddownFailJob != "" {
+		var c, p int
+		if n, err := fmt.Sscanf(opts.WinddownFailJob, "%d.%d", &c, &p); n == 2 && err == nil {
+			s.winddownFailJob = jobKey{c, p}
+			s.winddownFailArmed = true
+			s.log.Warn(logging.DestinationGeneral,
+				"shadow wind-down-failure test hook armed", "job", s.winddownFailJob.String())
+		}
+	}
 	return s
 }
 
@@ -314,7 +343,8 @@ func (s *Scheduler) Submit(ev Event) {
 	select {
 	case s.events <- ev:
 	default:
-		s.log.Warn(logging.DestinationGeneral, "scheduler event queue full; dropping event")
+		s.log.Warn(logging.DestinationGeneral, "scheduler event queue full; dropping event",
+			"event", fmt.Sprintf("%T", ev))
 	}
 }
 
@@ -767,15 +797,16 @@ func (s *Scheduler) runJob(ctx context.Context, m negotiate.Match, job *classad.
 	s.Submit(evStarted{c, p, slotName, claimID})
 
 	sh, err := shadow.New(ac.Stream(), ac, shadow.Config{
-		JobAd:            job,
-		ClaimID:          claimID,
-		TransferEndpoint: s.endpoint,
-		ShadowAddr:       s.scheddAddr,
-		ShadowVersion:    s.shadowVersion,
-		UIDDomain:        s.uidDomain,
-		Startd:           client,
-		Detach:           detach,
-		Privsep:          s.privsep,
+		JobAd:             job,
+		ClaimID:           claimID,
+		TransferEndpoint:  s.endpoint,
+		ShadowAddr:        s.scheddAddr,
+		ShadowVersion:     s.shadowVersion,
+		UIDDomain:         s.uidDomain,
+		Startd:            client,
+		Detach:            detach,
+		Privsep:           s.privsep,
+		ForceWinddownFail: s.winddownFailArmed && s.winddownFailJob == jobKey{c, p},
 		OnEvent: func(ev shadow.Event) {
 			if ev.Type == shadow.EventBeginExecution && s.consumePanicHook(c, p) {
 				panic(fmt.Sprintf("test hook: injected shadow panic for job %d.%d "+
@@ -861,6 +892,16 @@ func (s *Scheduler) handleStarted(e evStarted) {
 		}
 	}
 	s.log.Info(logging.DestinationGeneral, "job running", "job", key.String(), "slot", e.slotName)
+	// A job just left Idle: nudge the factory engine to top up to max_idle.
+	s.nudgeMaterialize()
+}
+
+// nudgeMaterialize invokes the late-materialization trigger if one is installed.
+// Never blocks the core (the engine's Nudge is non-blocking).
+func (s *Scheduler) nudgeMaterialize() {
+	if s.onJobLeftIdle != nil {
+		s.onJobLeftIdle()
+	}
 }
 
 // handleExited reaps a finished (or failed) job: on a normal exit it writes the
@@ -877,6 +918,8 @@ func (s *Scheduler) handleExited(e evExited) {
 		defer s.reapWaiters(ri)
 	}
 	defer s.maybeFinishDrain()
+	// A job just left the queue/Idle set: top up its factory (if any).
+	defer s.nudgeMaterialize()
 
 	if ri != nil && ri.detached {
 		s.log.Info(logging.DestinationGeneral,
@@ -897,11 +940,28 @@ func (s *Scheduler) handleExited(e evExited) {
 		return
 	}
 
-	if e.err != nil || e.res == nil {
+	if e.res == nil {
+		// No job result: a genuine run failure (claim/activate error, the serve loop
+		// died before job_exit, or a recovered panic). Apply the requeue-or-hold
+		// policy and count it as a shadow exception.
 		s.log.Warn(logging.DestinationGeneral, "shadow run failed",
 			"job", key.String(), "err", errStr(e.err))
 		s.jobFailed(e.c, e.p, errStr(e.err), true)
 		return
+	}
+	if e.err != nil {
+		// The job ran to completion (we have its exit Result) but the shadow's
+		// best-effort claim wind-down -- JOB_DONE / RELEASE_CLAIM to the startd --
+		// failed, typically a transient startd RPC timeout under load ("DaemonCore:
+		// Can't receive command request ..." on the startd). The job is DONE;
+		// completing it must NOT depend on releasing the claim (the startd reclaims
+		// it via its own lease/keepalive expiry). Treating this as a run failure was
+		// the HTCONDOR-3828 flake: under load a finished factory proc got requeued
+		// and re-run, and after MAX_SHADOW_EXCEPTIONS wind-down failures was HELD --
+		// so it never left the queue. Log and fall through to normal completion.
+		s.log.Warn(logging.DestinationGeneral,
+			"shadow claim wind-down failed after job completed; completing job anyway",
+			"job", key.String(), "err", errStr(e.err))
 	}
 
 	res := e.res

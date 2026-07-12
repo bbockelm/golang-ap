@@ -63,8 +63,22 @@ type Queue struct {
 	domain string
 	supers map[string]bool
 
-	mu     sync.Mutex // guards nextID + counter persistence
+	mu     sync.Mutex // guards nextID + counter persistence + factories set
 	nextID int
+
+	// factories is the set of cluster ids that are job factories (late
+	// materialization). Maintained on commit/destroy and recovered at Open.
+	// Guarded by mu.
+	factories map[int]bool
+
+	// onFactory, if set, is invoked when a new factory cluster is registered so
+	// the materialization engine sweeps promptly (see SetFactoryNudge). Guarded
+	// by mu.
+	onFactory func()
+
+	// factoryMu serializes late-materialization proc commits so the cluster ad's
+	// NextProcId/NextRow can never be advanced concurrently (see MaterializeProc).
+	factoryMu sync.Mutex
 
 	// onVacateRunning, if set, is invoked when a running job is removed or held
 	// so the scheduler core can tear down its shadow/claim first (see
@@ -119,6 +133,8 @@ func Open(opts Options) (*Queue, error) {
 			q.nextID = int(v)
 		}
 	}
+	// Recover the set of factory clusters (one-time probe of cluster ads).
+	q.recoverFactories()
 	return q, nil
 }
 

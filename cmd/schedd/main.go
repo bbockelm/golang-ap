@@ -31,6 +31,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/advertise"
+	"github.com/bbockelm/golang-ap/internal/factory"
 	"github.com/bbockelm/golang-ap/internal/match"
 	"github.com/bbockelm/golang-ap/internal/negotiate"
 	"github.com/bbockelm/golang-ap/internal/policy"
@@ -162,7 +163,7 @@ func run() error {
 		return fmt.Errorf("opening job queue: %w", err)
 	}
 	defer func() { _ = jobQueue.Close() }()
-	registerQueueCommands(srv, jobQueue, log)
+	registerQueueCommands(srv, jobQueue, log, resolveSpoolDir(cfg))
 
 	// The schedd's externally reachable command sinful ("<host:port?sock=...>"),
 	// used as the ALIVE scheduler address the startd calls back on, the starter's
@@ -239,8 +240,17 @@ func run() error {
 		defer cancel()
 		ulogMgr.Close(ctx)
 	}()
+	// Late materialization (job factories): the engine lazily materializes proc
+	// ads from a cluster's submit digest, keeping only max_idle idle at once. It
+	// runs off the scheduler core and is nudged whenever a job leaves Idle.
+	matEngine := factory.NewEngine(jobQueue, log,
+		configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
+	// Materialize a freshly submitted factory immediately (not on the next tick).
+	jobQueue.SetFactoryNudge(matEngine.Nudge)
+
 	scheduler = sched.New(sched.Options{
 		Logger:            log,
+		OnJobLeftIdle:     matEngine.Nudge,
 		AdvertiseInterval: configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second),
 		Advertise:         adv.Advertise,
 		Queue:             jobQueue,
@@ -262,6 +272,9 @@ func run() error {
 		// Chaos-test hook: "cluster.proc" whose first shadow run panics at
 		// begin_execution. Config param wins; env var accepted as a fallback.
 		PanicJob: configOrEnv(cfg, "GOLANG_AP_SHADOW_PANIC_AFTER_ACTIVATE"),
+		// Chaos-test hook: "cluster.proc" whose finished shadow reports a claim
+		// wind-down failure, exercising the completed-but-cleanup-failed path.
+		WinddownFailJob: configOrEnv(cfg, "GOLANG_AP_SHADOW_WINDDOWN_FAIL"),
 		// Shadow/claim reconnect: leave running jobs Running across a restart and
 		// re-attach to their starters. SCHEDD_RECONNECT=false restores the old
 		// drain-and-requeue behavior.
@@ -315,6 +328,9 @@ func run() error {
 	jobQueue.SetOnVacateRunning(func(c, p int) { scheduler.TeardownJobAndWait(c, p, 5*time.Second) })
 
 	scheduler.Start(ctx)
+	// Start the late-materialization engine (its own goroutine; returns on ctx
+	// cancel). Started after the core so an initial sweep can advertise promptly.
+	go matEngine.Run(ctx)
 	// Startup recovery: re-attach to any job a previous incarnation left Running
 	// (persisted JobStatus=2 with a live lease) instead of requeueing it. Runs on
 	// the core goroutine; bounded so a slow queue scan cannot wedge startup.

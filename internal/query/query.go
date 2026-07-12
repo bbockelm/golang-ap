@@ -63,26 +63,70 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 	if v, ok := queryAd.EvaluateAttrInt("LimitResults"); ok {
 		limit = int(v)
 	}
+	// condor_q -factory sets IncludeClusterAd (ATTR_QUERY_Q_INCLUDE_CLUSTER_AD) so
+	// the schedd also returns the (normally hidden) factory CLUSTER ads carrying
+	// the JobMaterialize* bookkeeping; its Requirements carry `ProcId is undefined
+	// && JobMaterializeDigestFile isnt undefined` to keep only those. NoProcAds
+	// (ATTR_QUERY_Q_NO_PROC_ADS) additionally suppresses the proc scan. Mirrors
+	// JOB_QUEUE_ITERATOR_OPT_INCLUDE_CLUSTERS / _NO_PROC_ADS in the C++ schedd's
+	// command_query_job_ads.
+	includeClusterAds := false
+	if v, ok := queryAd.EvaluateAttrBool("IncludeClusterAd"); ok {
+		includeClusterAds = v
+	}
+	noProcAds := false
+	if v, ok := queryAd.EvaluateAttrBool("NoProcAds"); ok {
+		noProcAds = v
+	}
 
 	// Stream each matching job ad as its own CEDAR message (ad + EOM).
 	var counts queue.Counts
 	if !summaryOnly {
 		n := 0
-		var iter func(func(*classad.ClassAd) bool)
-		if query != nil {
-			iter = s.q.Query(query)
-		} else {
-			iter = s.q.Scan()
-		}
-		for ad := range iter {
+		emit := func(ad *classad.ClassAd) (bool, error) {
 			if limit >= 0 && n >= limit {
-				break
+				return false, nil
 			}
 			tallyCount(&counts, ad)
 			if err := s.streamAd(ctx, c, ad, projection, sendServerTime); err != nil {
-				return err
+				return false, err
 			}
 			n++
+			return true, nil
+		}
+		if !noProcAds {
+			var iter func(func(*classad.ClassAd) bool)
+			if query != nil {
+				iter = s.q.Query(query)
+			} else {
+				iter = s.q.Scan()
+			}
+			for ad := range iter {
+				cont, err := emit(ad)
+				if err != nil {
+					return err
+				}
+				if !cont {
+					break
+				}
+			}
+		}
+		// Factory cluster ads (structurally hidden from the proc scan above): only
+		// when the query asked for them, and only those passing the query
+		// constraint (which for -factory filters to factories).
+		if includeClusterAds {
+			for ad := range s.q.FactoryClusterAds() {
+				if query != nil && !query.Matches(ad) {
+					continue
+				}
+				cont, err := emit(ad)
+				if err != nil {
+					return err
+				}
+				if !cont {
+					break
+				}
+			}
 		}
 	}
 	if summaryOnly {
