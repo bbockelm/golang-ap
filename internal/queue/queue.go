@@ -50,6 +50,24 @@ type Options struct {
 	// SuperUsers are the QUEUE_SUPER_USERS who may set Owner/User to another
 	// identity and use SetEffectiveOwner.
 	SuperUsers []string
+
+	// ImmutableAttrs / ProtectedAttrs / SecureAttrs are operator-supplied extra
+	// attribute names (from IMMUTABLE_JOB_ATTRS / PROTECTED_JOB_ATTRS /
+	// SECURE_JOB_ATTRS) folded on top of the SYSTEM_* defaults for per-attribute
+	// QMGMT authorization. See authz.go.
+	ImmutableAttrs []string
+	ProtectedAttrs []string
+	SecureAttrs    []string
+
+	// AllUsersTrusted maps QUEUE_ALL_USERS_TRUSTED: when true, client
+	// SetAttribute/DeleteAttribute skips the per-job ownership and protected-attr
+	// checks (matching qmgmt_all_users_trusted). Immutable attrs remain immutable.
+	AllUsersTrusted bool
+
+	// IgnoreSecureAttrs maps IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS (default
+	// true): silently ignore a client attempt to set a secure attribute instead
+	// of rejecting it.
+	IgnoreSecureAttrs bool
 }
 
 // Queue is the job-queue authority. It is safe for concurrent use: the backing
@@ -62,6 +80,8 @@ type Queue struct {
 	name   string
 	domain string
 	supers map[string]bool
+
+	authz  authzConfig // per-attribute / ownership QMGMT authorization (see authz.go)
 
 	mu     sync.Mutex // guards nextID + counter persistence + factories set
 	nextID int
@@ -125,6 +145,7 @@ func Open(opts Options) (*Queue, error) {
 		name:   opts.ScheddName,
 		domain: opts.UIDDomain,
 		supers: supers,
+		authz:  buildAuthzConfig(opts),
 		nextID: 1,
 	}
 	// Recover the cluster-id counter.

@@ -20,6 +20,11 @@ type Txn struct {
 	user     string // owner@domain
 	isSuper  bool
 
+	// allowProtected mirrors the per-connection allow-protected-attr-changes flag
+	// toggled by OpSetAllowProtectedChanges; a superuser (or all-trusted) needs it
+	// set to edit a protected attribute on a committed job. See authz.go.
+	allowProtected bool
+
 	active    int                         // active cluster for NewProc, or -1
 	pending   map[string]*classad.ClassAd // key -> staged ad (own attrs only)
 	nextProc  map[int]int                 // cluster -> next proc id in this txn
@@ -87,6 +92,11 @@ func (t *Txn) SetAttribute(c, p int, name, value string) error {
 	if value == "" {
 		return fmt.Errorf("empty value for attribute %s", name)
 	}
+	if ignore, err := t.authorize(c, p, name); err != nil {
+		return err
+	} else if ignore {
+		return nil // secure attr from a client: silently dropped
+	}
 	ad := t.stagedAd(string(jobKey(c, p)))
 	expr, err := classad.ParseExpr(value)
 	if err != nil {
@@ -104,8 +114,15 @@ func (t *Txn) SetAttribute(c, p int, name, value string) error {
 	return nil
 }
 
-// DeleteAttribute stages removal of an attribute.
-func (t *Txn) DeleteAttribute(c, p int, name string) {
+// DeleteAttribute stages removal of an attribute, subject to the same
+// per-attribute / ownership authorization as SetAttribute (deleting an immutable
+// or protected attribute, or any attribute of a job you do not own, is denied).
+func (t *Txn) DeleteAttribute(c, p int, name string) error {
+	if ignore, err := t.authorize(c, p, name); err != nil {
+		return err
+	} else if ignore {
+		return nil // secure attr from a client: silently dropped
+	}
 	key := string(jobKey(c, p))
 	if ad, ok := t.pending[key]; ok {
 		ad.Delete(name)
@@ -114,6 +131,15 @@ func (t *Txn) DeleteAttribute(c, p int, name string) {
 		t.delAttrs[key] = map[string]bool{}
 	}
 	t.delAttrs[key][name] = true
+	return nil
+}
+
+// SetAllowProtectedChanges toggles this connection's allow-protected-attr-changes
+// flag and returns the previous value, mirroring QmgmtSetAllowProtectedAttrChanges.
+func (t *Txn) SetAllowProtectedChanges(v bool) bool {
+	old := t.allowProtected
+	t.allowProtected = v
+	return old
 }
 
 // DestroyProc stages removal of a proc ad.
@@ -288,6 +314,14 @@ func (t *Txn) materialize(ad *classad.ClassAd, c, p int, now int64) {
 	// Proc ad.
 	_ = ad.Set("ProcId", int64(p))
 	_ = ad.Set("ClusterId", int64(c))
+	// Force the authenticated identity onto every proc ad, overwriting anything a
+	// client staged. Proc ads normally inherit Owner/User from the cluster ad by
+	// chaining, but the new-in-txn authorization exemption lets a client stage
+	// these on a fresh proc; forcing them here (like the cluster ad above)
+	// guarantees the committed identity is always the authenticated one, honoring
+	// a superuser's SetEffectiveOwner.
+	ad.InsertAttrString("Owner", t.owner)
+	ad.InsertAttrString("User", t.user)
 	if _, ok := ad.Lookup("JobStatus"); !ok {
 		_ = ad.Set("JobStatus", int64(StatusIdle))
 	}

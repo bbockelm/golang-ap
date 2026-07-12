@@ -11,6 +11,7 @@ package qmgmt
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +35,16 @@ const (
 	eACCES = 13
 	eINVAL = 22
 )
+
+// terrnoFor maps a SetAttribute/DeleteAttribute failure to the QMGMT terrno the
+// C++ schedd returns: EACCES for an authorization denial (immutable/protected/
+// secure attr or a cross-owner edit), EINVAL for a malformed request.
+func terrnoFor(err error) int {
+	if errors.As(err, new(*queue.AuthzError)) {
+		return eACCES
+	}
+	return eINVAL
+}
 
 // Server dispatches QMGMT operations against a job queue.
 type Server struct {
@@ -66,7 +77,17 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 	}
 	writable := c.Command == hqmgmt.WriteCmd
 
-	txn := s.q.Begin(authUser)
+	// allowProtected is a per-connection flag (like the C++ Q_SOCK's
+	// AllowProtectedAttrChanges) toggled by OpSetAllowProtectedChanges. It must
+	// survive the implicit transaction resets on Begin/Abort/Commit, so it lives
+	// here and is re-applied to every fresh transaction via begin().
+	allowProtected := false
+	begin := func() *queue.Txn {
+		tx := s.q.Begin(authUser)
+		tx.SetAllowProtectedChanges(allowProtected)
+		return tx
+	}
+	txn := begin()
 	// Per-connection scan cursor for GetNextJobByConstraint iteration.
 	var scanState []*classad.ClassAd
 	var scanPos int
@@ -100,14 +121,14 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 
 		case hqmgmt.OpBeginTransaction:
 			txn.Abort()
-			txn = s.q.Begin(authUser)
+			txn = begin()
 			if err := s.reply(ctx, c, 0, 0); err != nil {
 				return err
 			}
 
 		case hqmgmt.OpAbortTransaction:
 			txn.Abort()
-			txn = s.q.Begin(authUser)
+			txn = begin()
 			if err := s.reply(ctx, c, 0, 0); err != nil {
 				return err
 			}
@@ -122,7 +143,7 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 			if err := s.replyCommit(ctx, c, cerr); err != nil {
 				return err
 			}
-			txn = s.q.Begin(authUser) // fresh implicit transaction
+			txn = begin() // fresh implicit transaction
 
 		case hqmgmt.OpNewCluster:
 			if !writable {
@@ -195,7 +216,7 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 				continue
 			}
 			if serr != nil {
-				if e := s.reply(ctx, c, -1, eINVAL); e != nil {
+				if e := s.reply(ctx, c, -1, terrnoFor(serr)); e != nil {
 					return e
 				}
 				continue
@@ -215,7 +236,12 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 				_ = s.reply(ctx, c, -1, ePERM)
 				continue
 			}
-			txn.DeleteAttribute(cluster, proc, name)
+			if derr := txn.DeleteAttribute(cluster, proc, name); derr != nil {
+				if e := s.reply(ctx, c, -1, terrnoFor(derr)); e != nil {
+					return e
+				}
+				continue
+			}
 			if err := s.reply(ctx, c, 0, 0); err != nil {
 				return err
 			}
@@ -263,10 +289,19 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 			}
 
 		case hqmgmt.OpSetAllowProtectedChanges:
-			if _, err := rm.GetInt(ctx); err != nil { // value
+			val, err := rm.GetInt(ctx) // value
+			if err != nil {
 				return nil
 			}
-			if err := s.reply(ctx, c, 0, 0); err != nil {
+			// Per-connection toggle (survives transaction resets); the reply is the
+			// PREVIOUS value, matching QmgmtSetAllowProtectedAttrChanges.
+			allowProtected = val != 0
+			old := txn.SetAllowProtectedChanges(allowProtected)
+			oldVal := 0
+			if old {
+				oldVal = 1
+			}
+			if err := s.reply(ctx, c, oldVal, 0); err != nil {
 				return err
 			}
 

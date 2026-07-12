@@ -52,12 +52,36 @@ func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.
 		ScheddName: name,
 		UIDDomain:  strings.TrimSpace(uidDomain),
 		SuperUsers: supers,
+		// Per-attribute QMGMT authorization (see internal/queue/authz.go): the
+		// SYSTEM_* defaults are baked in; these knobs add operator extras and the
+		// trust toggles, mirroring the C++ schedd's config.
+		ImmutableAttrs:    attrList(cfg, "IMMUTABLE_JOB_ATTRS"),
+		ProtectedAttrs:    attrList(cfg, "PROTECTED_JOB_ATTRS"),
+		SecureAttrs:       attrList(cfg, "SECURE_JOB_ATTRS"),
+		AllUsersTrusted:   configBool(cfg, "QUEUE_ALL_USERS_TRUSTED", false),
+		IgnoreSecureAttrs: configBool(cfg, "IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS", true),
 	})
 	if err != nil {
 		return nil, err
 	}
 	log.Info(logging.DestinationGeneral, "job queue opened", "spool", spool, "jobs", q.Counts().Total)
 	return q, nil
+}
+
+// attrList splits a comma/space/tab-separated HTCondor attribute-list config
+// value (e.g. IMMUTABLE_JOB_ATTRS) into individual attribute names.
+func attrList(cfg *config.Config, key string) []string {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, a := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // registerQueueCommands registers the Stage 5 job-queue command handlers:
