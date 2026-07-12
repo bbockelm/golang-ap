@@ -1,12 +1,49 @@
 # golang-ap roadmap
 
-Open, post-MVP work items — most load-bearing first. Shipped features (runs
-under condor_master; claims/activates real startd slots; stock
-submit/q/hold/rm; negotiation with RRL batching; reconnect across restart;
-`-spool`; async off-core user-log writes with backpressure; supervision/chaos)
-are in `git log`, not here.
+## Shipped (see `git log`)
 
-## 1. Privilege separation — running work as separate Unix users
+MVP: runs under condor_master; claims/activates real startd slots; stock
+submit/q/hold/rm; negotiation with RRL batching; reconnect across restart;
+`-spool`; async off-core user-log writes with backpressure; supervision/chaos.
+
+Post-MVP roadmap items 1–5, all committed + signed on `main`:
+- **#1 Privilege separation** — per-owner file ownership via a backend-neutral
+  `droppriv.Privsep` abstraction (native Linux `setfsuid` + pooled FD-passing
+  helpers for darwin/CI). golang-ap `bbf6eff`; cedar/htcondor PRs #20/#118.
+- **#2 Job policy expressions** — periodic_hold/release/remove, on_exit_*,
+  SYSTEM_PERIODIC_*, off-core engine. `3e4482c`.
+- **#3 Late materialization / job factories** — lazy `queue N` / `queue from`,
+  max_idle/max_materialize, `condor_q -factory`; plus a real general fix
+  (completed job wrongly held when post-completion claim release failed).
+  `720fb9c`; cedar PR #24.
+- **#4 Per-attribute QMGMT authz + token submit** — immutable/protected/secure
+  classification + per-job ownership; IDTOKENS-authenticated remote submit
+  mapping token identity → Owner. `0b7e50a`.
+- **#5 Observability** — Prometheus `/metrics`, enriched schedd stats ad, live
+  DC_RECONFIG re-read of SCHEDD_* knobs. `ae0b0af`.
+
+## Open / future
+
+### #6 Durable / recoverable user-log writes — DEFERRED (low value)
+The user log is already async + best-effort, and consumers (DAGMan,
+condor_wait) reconcile from the queue, which is the source of truth — so a
+degraded log loses observability, never job state. Making writes transactional
+(intent in the queue txn, replay unflushed on restart) has expensive, racy
+idempotent recovery against files users can truncate/rotate, for little gain.
+Explicitly deprioritized. Design sketch retained below.
+
+### Alternates (higher value than #6 when work resumes)
+- **Out-of-process setuid shadows** — strict multi-user isolation (the deferred
+  #1 sub-item): goroutine-shadows for the personal-AP fast path, real setuid
+  shadow processes when the pool is multi-user.
+- **Flocking** to multiple pools; **DAGMan** end-to-end; **container/docker
+  universe**; **GPU / custom-resource** requests.
+
+---
+
+## Deferred design detail
+
+### 1. Privilege separation — running work as separate Unix users
 
 **Where we are.** The schedd is effectively single-uid. `UID_DOMAIN` is only a
 string suffix that forms the `User` attribute; `Owner`/`User` is enforced as
