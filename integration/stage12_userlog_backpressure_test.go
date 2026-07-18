@@ -240,7 +240,7 @@ queue
 	iSub := indexKind(events, userlog.KindSubmit)
 	iExe := indexKind(events, userlog.KindExecute)
 	iTerm := indexKind(events, userlog.KindJobTerminated)
-	if iSub < 0 || iExe < 0 || iTerm < 0 || !(iSub < iExe && iExe < iTerm) {
+	if iSub < 0 || iExe < 0 || iTerm < 0 || iSub >= iExe || iExe >= iTerm {
 		fail("job B log missing Submit->Execute->JobTerminated; events=%v", kindsOf(events))
 	}
 	t.Logf("job B log OK: Submit -> Execute -> JobTerminated (written by a healthy worker)")

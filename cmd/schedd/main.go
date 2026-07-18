@@ -605,7 +605,7 @@ func buildPrivsep(cfg *config.Config, log *logging.Logger) (droppriv.Privsep, er
 	mode := droppriv.ModeNative
 	switch strings.ToLower(strings.TrimSpace(configOrEnv(cfg, "SCHEDD_PRIVSEP_MODE"))) {
 	case "", "native":
-		mode = droppriv.ModeNative
+		// keep the default ModeNative
 	case "auto":
 		mode = droppriv.ModeAuto
 	case "pool":

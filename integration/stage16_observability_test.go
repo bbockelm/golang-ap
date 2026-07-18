@@ -258,7 +258,7 @@ func freePort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("allocating free port: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
 }
 

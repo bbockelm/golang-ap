@@ -51,7 +51,7 @@ func TestGroupStateNextIdleSkipsNonIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	txn := q.Begin("alice")
 	c, err := txn.NewCluster()

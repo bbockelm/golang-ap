@@ -247,7 +247,7 @@ STARTER_DEBUG = D_SECURITY:2 D_SYSCALLS:2 D_FULLDEBUG
 				t.Logf("get_job_info ad: TransferKey=%q TransferSocket=%q", tk, ts)
 			}
 		},
-		Logf:             t.Logf,
+		Logf: t.Logf,
 	})
 	if err != nil {
 		dumpLogs()

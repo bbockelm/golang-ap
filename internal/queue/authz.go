@@ -147,7 +147,7 @@ func (t *Txn) authorize(c, p int, name string) (ignore bool, err error) {
 	// Protected: allowed on a committed job only for a superuser (or all-trusted)
 	// that has enabled SetAllowProtectedAttrChanges on this connection.
 	if az.protected[lname] {
-		if !((t.isSuper || az.allUsersTrusted) && t.allowProtected) {
+		if (!t.isSuper && !az.allUsersTrusted) || !t.allowProtected {
 			return false, permErr("unauthorized setting of protected attribute %q denied in job %d.%d",
 				name, c, p)
 		}
