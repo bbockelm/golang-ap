@@ -29,7 +29,7 @@ func isAuthzErr(err error) bool {
 // A non-owner may not change attributes on a committed job they do not own.
 func TestAuthzCrossOwnerSetDenied(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	bob := q.Begin("bob")
@@ -51,7 +51,7 @@ func TestAuthzCrossOwnerSetDenied(t *testing.T) {
 // committed job (the condor_qedit happy path).
 func TestAuthzOwnerEditOwnJobAllowed(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	txn := q.Begin("alice")
@@ -74,7 +74,7 @@ func TestAuthzOwnerEditOwnJobAllowed(t *testing.T) {
 // nor by a superuser.
 func TestAuthzImmutableDenied(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	for _, attr := range []string{"Owner", "ClusterId", "ProcId", "User", "MyType", "AccountingGroup"} {
@@ -95,7 +95,7 @@ func TestAuthzImmutableDenied(t *testing.T) {
 // A superuser may edit another user's (non-immutable) job attribute.
 func TestAuthzSuperuserCrossOwnerAllowed(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	txn := q.Begin("condor") // a QUEUE_SUPER_USER
@@ -111,7 +111,7 @@ func TestAuthzSuperuserCrossOwnerAllowed(t *testing.T) {
 // all-trusted) that has enabled SetAllowProtectedAttrChanges.
 func TestAuthzProtected(t *testing.T) {
 	q := openAuthzQueue(t, Options{ProtectedAttrs: []string{"ProtMe"}})
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	// Owner (non-super) is always denied a protected attr.
@@ -138,7 +138,7 @@ func TestAuthzProtected(t *testing.T) {
 func TestAuthzSecure(t *testing.T) {
 	// Default: ignore quietly. SetAttribute returns nil but does not stage.
 	q := openAuthzQueue(t, Options{IgnoreSecureAttrs: true})
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 	txn := q.Begin("alice")
 	if err := txn.SetAttribute(c, 0, "AuthTokenSubject", `"attacker@evil"`); err != nil {
@@ -155,7 +155,7 @@ func TestAuthzSecure(t *testing.T) {
 
 	// Reject mode.
 	q2 := openAuthzQueue(t, Options{IgnoreSecureAttrs: false})
-	defer q2.Close()
+	defer func() { _ = q2.Close() }()
 	c2 := submitCluster(t, q2, "alice", 1)
 	if err := q2.Begin("alice").SetAttribute(c2, 0, "AuthTokenSubject", `"x"`); !isAuthzErr(err) {
 		t.Fatalf("secure-attr set (reject mode): want AuthzError, got %v", err)
@@ -167,7 +167,7 @@ func TestAuthzSecure(t *testing.T) {
 // submit could not set Owner-adjacent attrs on new jobs.
 func TestAuthzNewInTxnExempt(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	txn := q.Begin("alice")
 	c, err := txn.NewCluster()
@@ -199,7 +199,7 @@ func TestAuthzNewInTxnExempt(t *testing.T) {
 // superuser and the schedd's own System-initiated actions may.
 func TestAuthzActionOwnership(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	// Bob cannot hold alice's job.
@@ -228,7 +228,7 @@ func TestAuthzActionOwnership(t *testing.T) {
 // attrs stay immutable.
 func TestAuthzAllUsersTrusted(t *testing.T) {
 	q := openAuthzQueue(t, Options{AllUsersTrusted: true, ProtectedAttrs: []string{"ProtMe"}})
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	// Cross-owner edit now allowed.
@@ -246,7 +246,7 @@ func TestAuthzAllUsersTrusted(t *testing.T) {
 // and that both take effect for transactions begun after the reconfig.
 func TestSetAuthzLiveReconfig(t *testing.T) {
 	q := openAuthzQueue(t, Options{SuperUsers: []string{"condor", "root"}})
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 	c := submitCluster(t, q, "alice", 1)
 
 	// Before reconfig: "carol" is not a superuser, so she cannot edit alice's job.

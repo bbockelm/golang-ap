@@ -229,7 +229,7 @@ func maxResourceRequestCount(t *testing.T, path string) int {
 			continue
 		}
 		n := 0
-		fmt.Sscanf(m[1], "%d", &n)
+		_, _ = fmt.Sscanf(m[1], "%d", &n)
 		if n > max {
 			max = n
 		}

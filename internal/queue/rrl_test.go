@@ -58,7 +58,7 @@ func collectGroups(seq iter.Seq[RequestGroup]) []RequestGroup {
 // projection starts a NEW run (run-length, not global dedup).
 func TestRRLGroupingRuns(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	// One cluster, 7 procs. RequestMemory: 128,128,128,128,256,128,128.
 	// In proc order that is runs of 4, 1, 2.
@@ -96,12 +96,12 @@ func TestRRLGroupingRuns(t *testing.T) {
 // higher JobPrio first, regardless of submission (cluster id) order.
 func TestRRLPriorityOrdering(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	// Submit the low-priority cluster first (it gets the smaller cluster id).
 	low := submitJobs(t, q, "bob", 2, map[string]string{"JobPrio": "5"}, nil)
 	high := submitJobs(t, q, "bob", 2, map[string]string{"JobPrio": "10"}, nil)
-	if !(low < high) {
+	if low >= high {
 		t.Fatalf("expected low cluster id %d < high %d", low, high)
 	}
 
@@ -126,7 +126,7 @@ func TestRRLPriorityOrdering(t *testing.T) {
 // churn is handled at match time by the NEGOTIATE handler, not in the cursor.)
 func TestRRLCursorSnapshotStable(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	// Two groups: clusterA (mem 128) then clusterB (mem 256), two procs each.
 	submitJobs(t, q, "carol", 2, map[string]string{"RequestMemory": "128"}, nil)
@@ -165,7 +165,7 @@ func TestRRLCursorSnapshotStable(t *testing.T) {
 // iterations of an unchanged queue.
 func TestRRLChecksumStable(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	submitJobs(t, q, "dave", 3, nil, func(p int) map[string]string {
 		return map[string]string{"RequestMemory": "512", "RequestCpus": "1"}

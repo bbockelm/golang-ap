@@ -297,7 +297,7 @@ func TestStage13OnExitRemoveRequeue(t *testing.T) {
 		rc := afField(cfgFile, cluster, 0, "JobRunCount")
 		if rc != "" && rc != "undefined" {
 			var n int64
-			fmt.Sscanf(rc, "%d", &n)
+			_, _ = fmt.Sscanf(rc, "%d", &n)
 			if n > maxRun {
 				maxRun = n
 			}

@@ -372,7 +372,7 @@ queue
 	t.Logf("Go client submitted cluster %d", clusterB)
 
 	constraintB := fmt.Sprintf("ClusterId == %d", clusterB)
-	ads, err := schedd.Query(ctx, constraintB, []string{"JobStatus", "HoldReasonCode", "HoldReason"})
+	ads, _, err := schedd.QueryWithOptions(ctx, constraintB, &htcondor.QueryOptions{Projection: []string{"JobStatus", "HoldReasonCode", "HoldReason"}})
 	if err != nil {
 		fail("query after SubmitRemote failed: %v", err)
 	}
@@ -401,7 +401,7 @@ queue
 	released := false
 	deadline = time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		ads, err = schedd.Query(ctx, constraintB, []string{"JobStatus", "StageInFinish", "LastHoldReasonCode"})
+		ads, _, err = schedd.QueryWithOptions(ctx, constraintB, &htcondor.QueryOptions{Projection: []string{"JobStatus", "StageInFinish", "LastHoldReasonCode"}})
 		if err == nil && len(ads) == 1 {
 			st, _ := ads[0].EvaluateAttrInt("JobStatus")
 			if st == 1 || st == 2 {
@@ -435,7 +435,7 @@ queue
 	gone = false
 	deadline = time.Now().Add(150 * time.Second)
 	for time.Now().Before(deadline) {
-		ads, err = schedd.Query(ctx, constraintB, []string{"JobStatus"})
+		ads, _, err = schedd.QueryWithOptions(ctx, constraintB, &htcondor.QueryOptions{Projection: []string{"JobStatus"}})
 		if err == nil && len(ads) == 0 {
 			gone = true
 			break

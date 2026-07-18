@@ -55,7 +55,7 @@ func submitCluster(t *testing.T, q *Queue, owner string, n int) int {
 // over committed state; committed state is untouched until commit.
 func TestReadYourWritesInTxn(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	txn := q.Begin("alice")
 	c, err := txn.NewCluster()
@@ -82,7 +82,7 @@ func TestReadYourWritesInTxn(t *testing.T) {
 		t.Errorf("GetAttribute(ClusterAttr via proc) = %q, %v; want 42", v, ok)
 	}
 	// Deleted staged attrs disappear.
-	txn.DeleteAttribute(c, p, "Foo")
+	_ = txn.DeleteAttribute(c, p, "Foo")
 	if _, ok := txn.GetAttribute(c, p, "Foo"); ok {
 		t.Error("GetAttribute(Foo) after DeleteAttribute still present")
 	}
@@ -95,7 +95,7 @@ func TestReadYourWritesInTxn(t *testing.T) {
 // TestAbortDiscards: an aborted transaction leaves no trace.
 func TestAbortDiscards(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	txn := q.Begin("alice")
 	c, _ := txn.NewCluster()
@@ -115,7 +115,7 @@ func TestAbortDiscards(t *testing.T) {
 // forced attributes (ClusterId/ProcId/JobStatus/QDate/GlobalJobId/Owner/User).
 func TestAtomicMultiProcCommit(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	c := submitCluster(t, q, "alice", 3)
 
@@ -161,7 +161,7 @@ func TestAtomicMultiProcCommit(t *testing.T) {
 // can.
 func TestOwnerEnforcement(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	txn := q.Begin("alice")
 	if err := txn.SetEffectiveOwner("bob"); err == nil {
@@ -205,7 +205,7 @@ func TestCrashRecovery(t *testing.T) {
 	_ = q.Close()
 
 	q2 := openTestQueue(t, dir)
-	defer q2.Close()
+	defer func() { _ = q2.Close() }()
 
 	if got := q2.Counts().Total; got != 2 {
 		t.Fatalf("recovered Counts.Total = %d, want 2 (committed procs only)", got)
@@ -258,7 +258,7 @@ func TestCounterMonotonicity(t *testing.T) {
 	_ = q.Close()
 
 	q2 := openTestQueue(t, dir)
-	defer q2.Close()
+	defer func() { _ = q2.Close() }()
 	txn := q2.Begin("alice")
 	c, err := txn.NewCluster()
 	if err != nil {
@@ -273,7 +273,7 @@ func TestCounterMonotonicity(t *testing.T) {
 // TestHoldReleaseRemove: the JobStatus state machine plus history archiving.
 func TestHoldReleaseRemove(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	c := submitCluster(t, q, "alice", 3)
 

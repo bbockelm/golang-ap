@@ -97,7 +97,7 @@ func TestEngineLazyMaterialization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	// queue 10 with max_idle=3, arguments referencing $(Process).
 	digest := "arguments=run $(Process)\noutput=out.$(Process)\n\nQueue 10\n"

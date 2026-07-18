@@ -205,7 +205,7 @@ queue
 	iSub := indexKind(events, userlog.KindSubmit)
 	iExe := indexKind(events, userlog.KindExecute)
 	iTerm := indexKind(events, userlog.KindJobTerminated)
-	if iSub < 0 || iExe < 0 || iTerm < 0 || !(iSub < iExe && iExe < iTerm) {
+	if iSub < 0 || iExe < 0 || iTerm < 0 || iSub >= iExe || iExe >= iTerm {
 		fail("expected Submit -> Execute -> JobTerminated in order, got %v", kinds)
 	}
 	term := events[iTerm]
@@ -317,7 +317,7 @@ queue
 	iRel := indexKind(events2, userlog.KindJobReleased)
 	iAb := indexKind(events2, userlog.KindJobAborted)
 	if iSub2 < 0 || iHeld < 0 || iRel < 0 || iAb < 0 ||
-		!(iSub2 < iHeld && iHeld < iRel && iRel < iAb) {
+		iSub2 >= iHeld || iHeld >= iRel || iRel >= iAb {
 		fail("expected Submit -> JobHeld -> JobReleased -> JobAborted in order, got %v", kinds2)
 	}
 	held := events2[iHeld]
@@ -339,7 +339,7 @@ func parseUserLog(t *testing.T, path string) []userlog.Event {
 	if err != nil {
 		t.Fatalf("opening user log %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	events, err := userlog.Parse(f)
 	if err != nil {
 		t.Fatalf("parsing user log %s: %v", path, err)
