@@ -3,10 +3,10 @@ module github.com/bbockelm/golang-ap
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.5.2
-	github.com/PelicanPlatform/classad/collections v0.5.2
-	github.com/bbockelm/cedar v0.5.2
-	github.com/bbockelm/golang-htcondor v0.6.0
+	github.com/PelicanPlatform/classad v0.8.0
+	github.com/PelicanPlatform/classad/collections v0.8.0
+	github.com/bbockelm/cedar v0.5.6
+	github.com/bbockelm/golang-htcondor v0.7.0
 	github.com/prometheus/client_golang v1.13.0
 	golang.org/x/crypto v0.53.0
 )
