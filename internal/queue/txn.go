@@ -163,7 +163,11 @@ func (t *Txn) DestroyCluster(c int) {
 
 // GetAttribute returns the staged-or-committed expression string for c.p's attr.
 func (t *Txn) GetAttribute(c, p int, name string) (string, bool) {
-	key := string(jobKey(c, p))
+	// SA6001 suggests inlining this into the map index so the compiler
+	// can skip the conversion, but the key is read twice below. Inlining
+	// would call jobKey twice and convert twice, which is what the
+	// optimization exists to avoid.
+	key := string(jobKey(c, p)) //nolint:staticcheck // reused below; see above
 	if m := t.delAttrs[key]; m != nil && m[name] {
 		return "", false
 	}
