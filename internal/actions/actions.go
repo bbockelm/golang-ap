@@ -25,6 +25,7 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	"github.com/bbockelm/golang-ap/internal/identity"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -66,10 +67,7 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 		return fmt.Errorf("reading ACT_ON_JOBS command ad: %w", err)
 	}
 
-	authUser := ""
-	if c.Negotiation != nil {
-		authUser = c.Negotiation.User
-	}
+	authUser := identity.Caller(c) // "" when the peer did not authenticate
 
 	actionNum64, ok := cmdAd.EvaluateAttrInt("JobAction")
 	if !ok {

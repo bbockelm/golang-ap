@@ -62,8 +62,12 @@ func (t *Txn) SetEffectiveOwner(owner string) error {
 }
 
 // NewCluster allocates a new cluster id, makes it the active cluster, and stages
-// its (initially empty) cluster ad.
+// its (initially empty) cluster ad. An anonymous transaction may not submit:
+// there is no identity to stamp as the jobs' Owner.
 func (t *Txn) NewCluster() (int, error) {
+	if t.anonymous() {
+		return -1, errAnonymous()
+	}
 	id, err := t.q.allocClusterID()
 	if err != nil {
 		return -1, err
@@ -76,6 +80,9 @@ func (t *Txn) NewCluster() (int, error) {
 
 // NewProc allocates the next proc id in the active cluster and stages its ad.
 func (t *Txn) NewProc(cluster int) (int, error) {
+	if t.anonymous() {
+		return -1, errAnonymous() // UserCheck(nullptr, ...) in the C++ NewProc
+	}
 	if cluster != t.active {
 		return -1, fmt.Errorf("NewProc for cluster %d but active cluster is %d", cluster, t.active)
 	}
@@ -142,23 +149,53 @@ func (t *Txn) SetAllowProtectedChanges(v bool) bool {
 	return old
 }
 
-// DestroyProc stages removal of a proc ad.
-func (t *Txn) DestroyProc(c, p int) {
+// DestroyProc stages removal of a proc ad. Only the job's owner (or a queue
+// superuser) may destroy a committed job, matching "Only the owner can delete a
+// proc" in the C++ DestroyProc.
+func (t *Txn) DestroyProc(c, p int) error {
+	if t.anonymous() {
+		return errAnonymous()
+	}
+	if owner, committed := t.committedOwner(c, p); committed {
+		if err := t.checkOwner(t.q.authzSnapshot(), c, p, owner); err != nil {
+			return err
+		}
+	}
 	t.destroyed[string(jobKey(c, p))] = true
 	delete(t.pending, string(jobKey(c, p)))
+	return nil
 }
 
 // DestroyCluster stages removal of an entire cluster (its cluster ad and any of
-// its committed proc ads).
-func (t *Txn) DestroyCluster(c int) {
-	t.destroyed[clusterKeyStr(c)] = true
-	delete(t.pending, clusterKeyStr(c))
+// its committed proc ads), subject to the same ownership rule as DestroyProc
+// for the cluster ad and every committed proc.
+func (t *Txn) DestroyCluster(c int) error {
+	if t.anonymous() {
+		return errAnonymous()
+	}
+	az := t.q.authzSnapshot()
+	if owner, committed := t.committedOwner(c, -1); committed {
+		if err := t.checkOwner(az, c, -1, owner); err != nil {
+			return err
+		}
+	}
+	var procs []int
 	for ad := range t.q.coll.Scan() {
 		if cc, _, ok := jobIDs(ad); ok && cc == c {
 			pp, _ := ad.EvaluateAttrInt("ProcId")
-			t.destroyed[string(jobKey(c, int(pp)))] = true
+			owner, _ := ad.EvaluateAttrString("Owner")
+			if err := t.checkOwner(az, c, int(pp), owner); err != nil {
+				return err
+			}
+			procs = append(procs, int(pp))
 		}
 	}
+	t.destroyed[clusterKeyStr(c)] = true
+	delete(t.pending, clusterKeyStr(c))
+	for _, p := range procs {
+		t.destroyed[string(jobKey(c, p))] = true
+	}
+	return nil
 }
 
 // GetAttribute returns the staged-or-committed expression string for c.p's attr.
@@ -223,6 +260,12 @@ func (t *Txn) Abort() {
 func (t *Txn) Commit() error {
 	if len(t.errs) > 0 {
 		return fmt.Errorf("transaction has %d deferred error(s): %s", len(t.errs), t.errs[0])
+	}
+	// Nothing an anonymous transaction stages may reach the queue (it would
+	// commit with an empty Owner). The per-op gates already refuse; this is the
+	// backstop.
+	if t.anonymous() && (len(t.pending) > 0 || len(t.destroyed) > 0) {
+		return errAnonymous()
 	}
 	now := nowUnix()
 

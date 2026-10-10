@@ -59,6 +59,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/filetransfer"
 
+	"github.com/bbockelm/golang-ap/internal/identity"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -195,7 +196,7 @@ func (h *Handler) handleSpool(ctx context.Context, c *cedarserver.Conn) error {
 }
 
 func (h *Handler) doSpool(ctx context.Context, c *cedarserver.Conn) error {
-	authUser := c.Negotiation.User
+	authUser := identity.Caller(c) // "" when the peer did not authenticate
 	withPerms := c.Command == commands.SPOOL_JOB_FILES_WITH_PERMS
 
 	// msg1: [version] + JobAdsArrayLen.
@@ -341,7 +342,7 @@ func (h *Handler) handleTransfer(ctx context.Context, c *cedarserver.Conn) error
 }
 
 func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
-	authUser := c.Negotiation.User
+	authUser := identity.Caller(c) // "" when the peer did not authenticate
 	withPerms := c.Command == commands.TRANSFER_DATA_WITH_PERMS
 
 	// msg1: [version] + constraint.
