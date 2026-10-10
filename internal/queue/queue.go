@@ -13,6 +13,7 @@ package queue
 import (
 	"fmt"
 	"iter"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,11 @@ type Options struct {
 	// identity and use SetEffectiveOwner. An entry without a domain names
 	// that user in UIDDomain.
 	SuperUsers []string
+	// MayImpersonate is QUEUE_SUPER_USER_MAY_IMPERSONATE: when set, the user
+	// names (without domain) a super user may submit as. When nil, a super
+	// user may submit only as a user the schedd already knows (see
+	// Queue.mayImpersonate).
+	MayImpersonate *regexp.Regexp
 
 	// ImmutableAttrs / ProtectedAttrs / SecureAttrs are operator-supplied extra
 	// attribute names (from IMMUTABLE_JOB_ATTRS / PROTECTED_JOB_ATTRS /
@@ -438,6 +444,42 @@ func (q *Queue) JobUser(ad *classad.ClassAd) string {
 		return q.qualify(o)
 	}
 	return ""
+}
+
+// mayImpersonate reports whether a queue super user may submit jobs as
+// owner, as SuperUserAllowedToSetOwnerTo (qmgmt.cpp) decides: when
+// QUEUE_SUPER_USER_MAY_IMPERSONATE is set, owner's user name must match it;
+// otherwise owner must be a user the schedd already knows. The C++ schedd
+// knows a user by the user record it keeps once that user has submitted;
+// this schedd keeps none, so it knows a user that has a job in the queue or
+// in the history.
+func (q *Queue) mayImpersonate(owner string) bool {
+	if re := q.authzSnapshot().mayImpersonate; re != nil {
+		return re.MatchString(shortName(owner))
+	}
+	return q.knownUser(q.qualify(owner))
+}
+
+// knownUser reports whether user owns a job in the live queue or the
+// history.
+func (q *Queue) knownUser(user string) bool {
+	query, err := vm.Parse("User == " + classad.Quote(user))
+	if err != nil {
+		return false
+	}
+	// == compares strings ignoring case; SameUser compares the user part
+	// exactly.
+	for ad := range q.coll.Query(query) {
+		if q.SameUser(user, q.JobUser(ad)) {
+			return true
+		}
+	}
+	for ad := range q.hist.Query(query) {
+		if q.SameUser(user, q.JobUser(ad)) {
+			return true
+		}
+	}
+	return false
 }
 
 // globalJobID builds "<ScheddName>#<c>.<p>#<QDate>".

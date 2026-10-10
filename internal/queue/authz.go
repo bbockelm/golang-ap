@@ -2,6 +2,7 @@ package queue
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -59,8 +60,9 @@ type authzConfig struct {
 	immutable       map[string]bool
 	protected       map[string]bool
 	secure          map[string]bool
-	allUsersTrusted bool // QUEUE_ALL_USERS_TRUSTED: bypass owner + protected checks
-	ignoreSecure    bool // IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS (default true)
+	allUsersTrusted bool           // QUEUE_ALL_USERS_TRUSTED: bypass owner + protected checks
+	ignoreSecure    bool           // IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS (default true)
+	mayImpersonate  *regexp.Regexp // QUEUE_SUPER_USER_MAY_IMPERSONATE
 }
 
 // buildAuthzConfig folds the system defaults together with any operator-supplied
@@ -85,6 +87,7 @@ func buildAuthzConfig(opts Options) authzConfig {
 		secure:          mk(systemSecureJobAttrs, opts.SecureAttrs),
 		allUsersTrusted: opts.AllUsersTrusted,
 		ignoreSecure:    opts.IgnoreSecureAttrs,
+		mayImpersonate:  opts.MayImpersonate,
 	}
 }
 

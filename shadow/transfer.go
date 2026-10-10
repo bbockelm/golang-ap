@@ -55,6 +55,8 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/golang-htcondor/droppriv"
 	"github.com/bbockelm/golang-htcondor/filetransfer"
+
+	"github.com/bbockelm/golang-ap/internal/identity"
 )
 
 // stdout/stderr sandbox names the starter transfers back (file_transfer.cpp
@@ -462,17 +464,6 @@ func (s *Shadow) privsep() droppriv.Privsep {
 	return droppriv.DefaultPrivsep()
 }
 
-// privsepUser maps a job Owner to the droppriv user to run per-user file ops as.
-// droppriv rejects "root"/"condor" and treats "" as "run as the current user,
-// no privilege switch", so any owner that is not a normal username maps to "".
-func privsepUser(owner string) string {
-	owner = strings.TrimSpace(owner)
-	if owner == "" || owner == "root" || owner == "condor" {
-		return ""
-	}
-	return owner
-}
-
 // buildInputPlan builds the list of files the shadow uploads to the starter: the
 // executable (as basename(Cmd), when TransferExecutable is not false) followed
 // by the TransferInput files. Sources are resolved against Iwd for relative
@@ -485,8 +476,10 @@ func (s *Shadow) buildInputPlan() (filetransfer.SendPlan, error) {
 	plan := filetransfer.SendPlan{FinalTransfer: true}
 
 	ps := s.privsep()
-	ownerRaw, _ := ad.EvaluateAttrString("Owner")
-	owner := privsepUser(ownerRaw)
+	owner, err := identity.JobAccount(ad)
+	if err != nil {
+		return plan, fmt.Errorf("shadow: %w", err)
+	}
 	ctx := context.Background()
 
 	seen := map[string]bool{}
@@ -547,12 +540,15 @@ func (s *Shadow) buildOutputSink() (filetransfer.Sink, error) {
 	if errf, _ := ad.EvaluateAttrString("Err"); errf != "" && errf != stderrRemapName && errf != "/dev/null" {
 		remap[stderrRemapName] = errf
 	}
-	ownerRaw, _ := ad.EvaluateAttrString("Owner")
+	owner, err := identity.JobAccount(ad)
+	if err != nil {
+		return nil, fmt.Errorf("shadow: %w", err)
+	}
 	return &iwdSink{
 		iwd:   iwd,
 		remap: remap,
 		ps:    s.privsep(),
-		owner: privsepUser(ownerRaw),
+		owner: owner,
 		ctx:   context.Background(),
 		logf:  s.logf,
 	}, nil

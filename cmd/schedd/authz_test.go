@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,7 +20,9 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
+	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 	hqmgmt "github.com/bbockelm/golang-htcondor/qmgmt"
 
@@ -30,10 +36,10 @@ import (
 	"github.com/bbockelm/golang-ap/shadow"
 )
 
-// These tests drive the schedd's command server as run() builds it
-// (installAuthz, the real command registrations, serveCommands) over
-// loopback, and check that the ALLOW_/DENY_ policy decides which identities
-// may run which command.
+// These tests drive the schedd's command server as run() builds it (the
+// daemon's Authz with authzOptions, installAuthz, the DaemonCore defaults,
+// the real command registrations, Authz.Serve) over loopback, and check that
+// the ALLOW_/DENY_ policy decides which identities may run which command.
 //
 // Identities are HTCondor's full user@domain names. A peer is given one by a
 // pre-shared session the schedd attributes to that identity (the way a claim
@@ -45,78 +51,84 @@ const testTrustDomain = "pool"
 // authzSchedd is a running schedd command server plus the means to reach it
 // as any identity.
 type authzSchedd struct {
-	addr    string
-	cfg     *config.Config
-	keyDir  string
-	cache   *security.SessionCache
-	az      *scheddAuthz
-	q       *queue.Queue
-	log     *logging.Logger
-	stats   *stats.Collector
-	records chan slog.Record
+	addr      string
+	cfgFile   string
+	keyDir    string
+	cache     *security.SessionCache
+	az        *daemon.Authz
+	q         *queue.Queue
+	log       *logging.Logger
+	stats     *stats.Collector
+	records   chan slog.Record
+	reconfigs atomic.Int32
 }
 
 // startAuthzSchedd serves the schedd's commands with the ALLOW_/DENY_
-// policy knobs. SEC_DEFAULT_AUTHENTICATION is OPTIONAL, so an anonymous peer
-// can negotiate every level that does not force authentication and only the
-// authorization policy keeps it out.
+// policy knobs, read from a configuration file as a daemon reads its own, so
+// DC_RECONFIG reloads it. SEC_DEFAULT_AUTHENTICATION is OPTIONAL, so an
+// anonymous peer can negotiate every level that does not force
+// authentication and only the authorization policy keeps it out.
 func startAuthzSchedd(t *testing.T, knobs map[string]string) *authzSchedd {
 	t.Helper()
-	keyDir := t.TempDir()
-	if err := security.GeneratePoolSigningKey(filepath.Join(keyDir, "POOL")); err != nil {
+	as := &authzSchedd{
+		cfgFile: filepath.Join(t.TempDir(), "condor_config"),
+		keyDir:  t.TempDir(),
+		records: make(chan slog.Record, 64),
+	}
+	if err := security.GeneratePoolSigningKey(filepath.Join(as.keyDir, "POOL")); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.NewEmpty()
-	for k, v := range map[string]string{
-		"SEC_DEFAULT_AUTHENTICATION":         "OPTIONAL",
-		"SEC_DEFAULT_ENCRYPTION":             "OPTIONAL",
-		"SEC_DEFAULT_INTEGRITY":              "OPTIONAL",
-		"SEC_DEFAULT_AUTHENTICATION_METHODS": "IDTOKENS",
-		"SEC_DEFAULT_CRYPTO_METHODS":         "AES",
-		"SEC_TOKEN_POOL_SIGNING_KEY_FILE":    filepath.Join(keyDir, "POOL"),
-		"SEC_PASSWORD_DIRECTORY":             keyDir,
-		"TRUST_DOMAIN":                       testTrustDomain,
-	} {
-		cfg.Set(k, v)
+	as.writeConfig(t, knobs)
+	t.Setenv("CONDOR_CONFIG", as.cfgFile)
+	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "SCHEDD"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for k, v := range knobs {
-		cfg.Set(k, v)
+	as.log, err = logging.New(&logging.Config{OutputPath: filepath.Join(t.TempDir(), "log")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := daemon.New(daemon.Options{Subsys: "SCHEDD", Config: cfg, Logger: as.log})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// As run() builds it.
-	sec, err := htcondor.GetServerSecurityConfig(cfg, commands.QUERY_SCHEDD_ADS, "DAEMON")
+	sec, err := d.ServerSecurityConfig(commands.QUERY_SCHEDD_ADS, "DAEMON")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache := security.NewSessionCache()
-	sec.SessionCache = cache
+	as.cache = security.NewSessionCache()
+	sec.SessionCache = as.cache
 	srv := cedarserver.New(sec)
-	az, err := newScheddAuthz(cfg)
+	as.az, err = d.NewAuthz(authzOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := installAuthz(srv, az, cfg, sec); err != nil {
+	if err := installAuthz(srv, as.az, sec, d.ServerSecurityConfig); err != nil {
 		t.Fatal(err)
 	}
+	d.RegisterDefaultCommands(srv)
 
-	log, err := logging.New(&logging.Config{OutputPath: filepath.Join(t.TempDir(), "log")})
-	if err != nil {
-		t.Fatal(err)
-	}
 	spoolDir := t.TempDir()
-	q, err := queue.Open(queue.Options{Dir: spoolDir, ScheddName: "schedd", UIDDomain: testTrustDomain})
+	as.q, err = queue.Open(queue.Options{Dir: spoolDir, ScheddName: "schedd", UIDDomain: testTrustDomain})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = q.Close() })
-	registerQueueCommands(srv, q, log, spoolDir)
-	st := stats.New()
-	neg := negotiate.New(q, log, func(negotiate.Match) {})
-	neg.SetStats(st)
+	t.Cleanup(func() { _ = as.q.Close() })
+	registerQueueCommands(srv, as.q, as.log, spoolDir)
+	as.stats = stats.New()
+	neg := negotiate.New(as.q, as.log, func(negotiate.Match) {})
+	neg.SetStats(as.stats)
 	neg.Register(srv)
+	scheduler := sched.New(sched.Options{})
+	matEngine := factory.NewEngine(as.q, as.log, 0)
+	d.OnReconfig(func(newCfg *config.Config) {
+		reconfigure(newCfg, as.log, scheduler, matEngine, as.q)
+		as.reconfigs.Add(1)
+	})
 
-	records := make(chan slog.Record, 64)
-	logger := slog.New(&recordHandler{ch: records})
+	logger := slog.New(&recordHandler{ch: as.records})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -125,15 +137,38 @@ func startAuthzSchedd(t *testing.T, knobs map[string]string) *authzSchedd {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = serveCommands(srv, az, logger)(ctx, ln)
+		_ = as.az.Serve(srv, logger)(ctx, ln)
 	}()
 	t.Cleanup(func() {
 		cancel()
 		<-done
 	})
-	return &authzSchedd{
-		addr: ln.Addr().String(), cfg: cfg, keyDir: keyDir, cache: cache,
-		az: az, q: q, log: log, stats: st, records: records,
+	as.addr = ln.Addr().String()
+	return as
+}
+
+// writeConfig writes the schedd's configuration file: the test pool's
+// security settings plus knobs.
+func (as *authzSchedd) writeConfig(t *testing.T, knobs map[string]string) {
+	t.Helper()
+	var b strings.Builder
+	for k, v := range map[string]string{
+		"SEC_DEFAULT_AUTHENTICATION":         "OPTIONAL",
+		"SEC_DEFAULT_ENCRYPTION":             "OPTIONAL",
+		"SEC_DEFAULT_INTEGRITY":              "OPTIONAL",
+		"SEC_DEFAULT_AUTHENTICATION_METHODS": "IDTOKENS",
+		"SEC_DEFAULT_CRYPTO_METHODS":         "AES",
+		"SEC_TOKEN_POOL_SIGNING_KEY_FILE":    filepath.Join(as.keyDir, "POOL"),
+		"SEC_PASSWORD_DIRECTORY":             as.keyDir,
+		"TRUST_DOMAIN":                       testTrustDomain,
+	} {
+		fmt.Fprintf(&b, "%s = %s\n", k, v)
+	}
+	for k, v := range knobs {
+		fmt.Fprintf(&b, "%s = %s\n", k, v)
+	}
+	if err := os.WriteFile(as.cfgFile, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -209,6 +244,32 @@ func (as *authzSchedd) dial(t *testing.T, sec *security.SecurityConfig, cmd int)
 	}
 	t.Cleanup(func() { _ = cl.Close() })
 	return cl, ctx, nil
+}
+
+// command sends cmd, which carries no payload and no reply, as sec's
+// identity. Over a resumed session the schedd refuses a command by closing
+// the connection, which the client cannot tell from success; the denial log
+// and the command's effect tell them apart.
+func (as *authzSchedd) command(t *testing.T, sec *security.SecurityConfig, cmd int) {
+	t.Helper()
+	if _, _, err := as.dial(t, sec, cmd); err != nil {
+		t.Fatalf("sending command %d: %v", cmd, err)
+	}
+}
+
+// reconfig sends DC_RECONFIG as sec's identity and waits for the schedd to
+// finish reloading its configuration.
+func (as *authzSchedd) reconfig(t *testing.T, sec *security.SecurityConfig) {
+	t.Helper()
+	before := as.reconfigs.Load()
+	as.command(t, sec, commands.DC_RECONFIG)
+	deadline := time.Now().Add(10 * time.Second)
+	for as.reconfigs.Load() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("DC_RECONFIG was accepted but the schedd did not reconfigure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // negotiate opens NEGOTIATE as sec's identity, asks for the first job of
@@ -472,23 +533,26 @@ func TestAuthzQmgmtWriteForcesAuthentication(t *testing.T) {
 	}
 }
 
-// TestAuthzReconfigReloads: reconfigure rebuilds the policy, so a changed
+// TestAuthzReconfigReloads: DC_RECONFIG rebuilds the policy, so a changed
 // ALLOW_WRITE (here its _SCHEDD variant) decides the next command.
 func TestAuthzReconfigReloads(t *testing.T) {
 	as := startAuthzSchedd(t, map[string]string{
-		"ALLOW_WRITE": "alice@pool",
-		"ALLOW_READ":  "*",
+		"ALLOW_WRITE":         "alice@pool",
+		"ALLOW_READ":          "*",
+		"ALLOW_ADMINISTRATOR": "admin@pool",
 	})
 	if _, err := as.newCluster(t, as.as(t, "bob@pool")); err == nil {
 		t.Fatal("QMGMT NewCluster as bob@pool succeeded before reconfig, want refused")
 	}
 	as.waitDenial(t)
 
-	next := config.NewEmpty()
-	next.Set("ALLOW_WRITE", "alice@pool")
-	next.Set("ALLOW_WRITE_SCHEDD", "bob@pool")
-	next.Set("ALLOW_READ", "*")
-	reconfigure(next, as.log, sched.New(sched.Options{}), factory.NewEngine(as.q, as.log, 0), as.q, as.az)
+	as.writeConfig(t, map[string]string{
+		"ALLOW_WRITE":         "alice@pool",
+		"ALLOW_WRITE_SCHEDD":  "bob@pool",
+		"ALLOW_READ":          "*",
+		"ALLOW_ADMINISTRATOR": "admin@pool",
+	})
+	as.reconfig(t, as.as(t, "admin@pool"))
 
 	if id, err := as.newCluster(t, as.as(t, "bob@pool")); err != nil || id <= 0 {
 		t.Fatalf("QMGMT NewCluster as bob@pool after reconfig = %d, %v; want a cluster id", id, err)
@@ -497,6 +561,26 @@ func TestAuthzReconfigReloads(t *testing.T) {
 		t.Fatal("QMGMT NewCluster as alice@pool succeeded after reconfig dropped her, want refused")
 	}
 	as.expectDenial(t, "QMGMT_WRITE_CMD", "WRITE", "alice@pool", "ALLOW_WRITE_SCHEDD", "")
+}
+
+// TestAuthzFamilySessionReconfigures: condor_master's family session may
+// reconfigure the schedd (condor_reconfig) whatever ALLOW_ADMINISTRATOR and
+// DENY_ADMINISTRATOR say, as DaemonCore punches ADMINISTRATOR for it; any
+// other identity is decided by the lists.
+func TestAuthzFamilySessionReconfigures(t *testing.T) {
+	as := startAuthzSchedd(t, map[string]string{
+		"ALLOW_ADMINISTRATOR": "admin@pool",
+		"DENY_ADMINISTRATOR":  "condor@*",
+		"ALLOW_READ":          "*",
+	})
+	for _, who := range []string{"alice@pool", "condor@pool"} {
+		as.command(t, as.as(t, who), commands.DC_RECONFIG)
+		as.expectDenial(t, "DC_RECONFIG", "ADMINISTRATOR", who, "ALLOW_ADMINISTRATOR", "DENY_ADMINISTRATOR")
+	}
+	if n := as.reconfigs.Load(); n != 0 {
+		t.Fatalf("schedd reconfigured %d time(s) on refused DC_RECONFIGs, want 0", n)
+	}
+	as.reconfig(t, as.as(t, "condor@family"))
 }
 
 // TestAuthzFamilySession: condor_master's family session holds the levels
@@ -534,20 +618,39 @@ func TestAuthzFamilySession(t *testing.T) {
 	}
 }
 
-// TestAuthzAdvertisesNegotiatedCommandOnly: the post-auth reply lists only
-// the negotiated command, so a C++ client negotiates a new session for each
-// other command instead of resuming one it would then re-authenticate on.
-func TestAuthzAdvertisesNegotiatedCommandOnly(t *testing.T) {
-	as := startAuthzSchedd(t, map[string]string{
-		"ALLOW_WRITE": "*",
-		"ALLOW_READ":  "*",
-	})
-	cl, _, err := as.dial(t, as.token(t, "alice@pool"), commands.QMGMT_WRITE_CMD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cl.GetSecurityNegotiation().ValidCommands; got != "1112" {
-		t.Fatalf("post-auth ValidCommands = %q, want only QMGMT_WRITE_CMD (1112)", got)
+// TestAuthzNegotiatorMatchSession: the negotiator's match session holds
+// NEGOTIATOR whatever ALLOW_NEGOTIATOR says while
+// SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION is on (its default), as the C++
+// schedd punches it, and is decided by the lists when it is off.
+func TestAuthzNegotiatorMatchSession(t *testing.T) {
+	for _, tc := range []struct {
+		knob string
+		want bool
+	}{{"", true}, {"true", true}, {"false", false}} {
+		t.Run("SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION="+tc.knob, func(t *testing.T) {
+			knobs := map[string]string{
+				"ALLOW_NEGOTIATOR": "negotiator@pool",
+				"ALLOW_READ":       "*",
+			}
+			if tc.knob != "" {
+				knobs["SEC_ENABLE_MATCH_PASSWORD_AUTHENTICATION"] = tc.knob
+			}
+			as := startAuthzSchedd(t, knobs)
+			op, err := as.negotiate(t, as.as(t, authz.NegotiatorSideMatchSessionFQU))
+			if !tc.want {
+				if err == nil {
+					t.Fatalf("NEGOTIATE over the match session answered %d, want refused", op)
+				}
+				as.expectDenial(t, "NEGOTIATE", "NEGOTIATOR", authz.NegotiatorSideMatchSessionFQU, "ALLOW_NEGOTIATOR", "")
+				return
+			}
+			if err != nil || op != commands.NO_MORE_JOBS {
+				t.Fatalf("NEGOTIATE over the match session = %d, %v; want NO_MORE_JOBS", op, err)
+			}
+			if as.az.Authorize("WRITE", "127.0.0.1:1", authz.NegotiatorSideMatchSessionFQU) {
+				t.Error("match session authorized at WRITE; the schedd grants it NEGOTIATOR only")
+			}
+		})
 	}
 }
 
@@ -561,11 +664,14 @@ func TestCommandLevelsMatchCxx(t *testing.T) {
 	cfg.Set("SEC_DEFAULT_AUTHENTICATION", "OPTIONAL")
 	sec := &security.SecurityConfig{SessionCache: security.NewSessionCache()}
 	srv := cedarserver.New(sec)
-	az, err := newScheddAuthz(cfg)
+	az, err := daemon.NewAuthz(cfg, authzOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := installAuthz(srv, az, cfg, sec); err != nil {
+	levelConfig := func(command int, secContext string) (*security.SecurityConfig, error) {
+		return htcondor.GetServerSecurityConfig(cfg, command, secContext)
+	}
+	if err := installAuthz(srv, az, sec, levelConfig); err != nil {
 		t.Fatal(err)
 	}
 	registerQueueCommands(srv, as.q, as.log, t.TempDir())
@@ -613,12 +719,14 @@ func TestCommandLevelsMatchCxx(t *testing.T) {
 // PERMISSION DENIED.
 func TestLogDenialIgnoresOtherErrors(t *testing.T) {
 	records := make(chan slog.Record, 4)
-	az, err := newScheddAuthz(config.NewEmpty())
+	az, err := daemon.NewAuthz(config.NewEmpty(), authzOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	az.logDenial(slog.New(&recordHandler{ch: records}), nil, "127.0.0.1:1",
-		errors.New("cedar/server: command 1112 (QMGMT_WRITE_CMD) refused: session (authenticated=false encrypted=false) does not meet the command's security level"))
+	if az.LogDenial(slog.New(&recordHandler{ch: records}), nil, "127.0.0.1:1",
+		errors.New("cedar/server: command 1112 (QMGMT_WRITE_CMD) refused: session (authenticated=false encrypted=false) does not meet the command's security level")) {
+		t.Error("LogDenial reported a security-level refusal as an authorization denial")
+	}
 	if len(records) != 0 {
 		t.Errorf("logged %d records for a security-level refusal, want 0", len(records))
 	}
