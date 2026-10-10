@@ -166,7 +166,7 @@ func waitForCondorStatusSchedd(t *testing.T, configFile string, timeout time.Dur
 
 // locateWithRetry polls the collector for a daemon of the given type until one
 // with a non-empty address appears or the timeout elapses.
-func locateWithRetry(t *testing.T, ctx context.Context, col *htcondor.Collector, adType string, timeout time.Duration) string {
+func locateWithRetry(t *testing.T, ctx context.Context, col *htcondor.Collector, adType htcondor.DaemonType, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
