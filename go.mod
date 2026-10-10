@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/PelicanPlatform/classad v0.8.0
 	github.com/PelicanPlatform/classad/collections v0.8.0
-	github.com/bbockelm/cedar v0.6.1
+	github.com/bbockelm/cedar v0.7.4
 	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/prometheus/client_golang v1.13.0
 	golang.org/x/crypto v0.54.0

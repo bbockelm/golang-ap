@@ -54,6 +54,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
+	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
 	"github.com/bbockelm/golang-htcondor/droppriv"
@@ -123,13 +124,30 @@ func privsepUser(owner string) string {
 	return owner
 }
 
-// ownerOf returns the privsep user for job c.p, read from its ad's Owner.
-func (h *Handler) ownerOf(c, p int) string {
-	if ad, ok := h.q.Get(c, p); ok {
-		owner, _ := ad.EvaluateAttrString("Owner")
-		return privsepUser(owner)
+// jobAccount returns the privsep user to handle ad's sandbox as (see
+// privsepUser). It refuses a job whose User is in the "unmapped" domain (an
+// SSL or SciTokens identity no map file named): its Owner is not a local
+// account, so no account lookup, chown or privilege switch may be made for it.
+func jobAccount(ad *classad.ClassAd) (string, error) {
+	user, _ := ad.EvaluateAttrString("User")
+	if _, domain := security.SplitFQU(user); strings.EqualFold(domain, security.UnmappedDomain) {
+		return "", fmt.Errorf("job owner %q is not a local account", user)
 	}
-	return ""
+	owner, _ := ad.EvaluateAttrString("Owner")
+	return privsepUser(owner), nil
+}
+
+// ownerOf returns the privsep user for job c.p (see jobAccount).
+func (h *Handler) ownerOf(c, p int) (string, error) {
+	ad, ok := h.q.Get(c, p)
+	if !ok {
+		return "", fmt.Errorf("spool: job %d.%d not found", c, p)
+	}
+	owner, err := jobAccount(ad)
+	if err != nil {
+		return "", fmt.Errorf("spool: job %d.%d: %w", c, p, err)
+	}
+	return owner, nil
 }
 
 // chownSandbox, on a privileged schedd (euid 0), changes ownership of the whole
@@ -245,7 +263,10 @@ func (h *Handler) doSpool(ctx context.Context, c *cedarserver.Conn) error {
 	opts.ReceiveAck = true
 	for _, j := range jobs {
 		dir := SandboxDir(h.spoolDir, j[0], j[1])
-		owner := h.ownerOf(j[0], j[1])
+		owner, err := h.ownerOf(j[0], j[1])
+		if err != nil {
+			return err
+		}
 		// Create the per-job sandbox and land every received file AS the job
 		// owner (droppriv), so on a privileged schedd the sandbox tree is owned
 		// by the user rather than the schedd uid.
@@ -293,6 +314,9 @@ func (h *Handler) preSpoolCheck(authUser string, c, p int, now int64) error {
 	}
 	if !h.q.OwnsJobAd(authUser, ad) {
 		return fmt.Errorf("spool: user %q may not spool for job %d.%d", authUser, c, p)
+	}
+	if _, err := jobAccount(ad); err != nil {
+		return fmt.Errorf("spool: job %d.%d: %w", c, p, err)
 	}
 	if fin, ok := ad.EvaluateAttrInt("StageInFinish"); ok && fin != 0 {
 		return fmt.Errorf("spool: stagein already finished for job %d.%d", c, p)
@@ -361,12 +385,18 @@ func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
 	if err != nil {
 		return fmt.Errorf("parse/evaluate constraint %q: %w", constraint, err)
 	}
-	// Only jobs this user owns.
+	// Only jobs this user owns, and whose owner is a local account.
 	owned := ads[:0]
 	for _, ad := range ads {
-		if h.q.OwnsJobAd(authUser, ad) {
-			owned = append(owned, ad)
+		if !h.q.OwnsJobAd(authUser, ad) {
+			continue
 		}
+		if _, err := jobAccount(ad); err != nil {
+			cl, pr, _ := jobIDsOf(ad)
+			h.logf("spool: TRANSFER_DATA: skipping job %d.%d: %v", cl, pr, err)
+			continue
+		}
+		owned = append(owned, ad)
 	}
 	ads = owned
 	h.logf("spool: TRANSFER_DATA: %d job(s) match %q", len(ads), constraint)
@@ -420,8 +450,11 @@ func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
 // the best-effort read consumes.
 func (h *Handler) sendSandbox(ctx context.Context, st *stream.Stream, ad *classad.ClassAd, c, p int) error {
 	dir := SandboxDir(h.spoolDir, c, p)
-	owner, _ := ad.EvaluateAttrString("Owner")
-	specs, size, err := h.outputSpecs(ctx, privsepUser(owner), ad, dir)
+	owner, err := jobAccount(ad)
+	if err != nil {
+		return err
+	}
+	specs, size, err := h.outputSpecs(ctx, owner, ad, dir)
 	if err != nil {
 		return err
 	}

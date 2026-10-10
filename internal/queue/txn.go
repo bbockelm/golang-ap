@@ -42,22 +42,29 @@ func (t *Txn) AddError(msg string) { t.errs = append(t.errs, msg) }
 // SetJobFactory target), or -1 if none. Mirrors qmgmt.cpp active_cluster_num.
 func (t *Txn) ActiveCluster() int { return t.active }
 
-// SetEffectiveOwner changes the owner for jobs created in this transaction. Only
-// honored for super users (non-supers are pinned to their authenticated user),
-// matching QmgmtSetEffectiveOwner.
+// SetEffectiveOwner changes the owner for jobs created in this transaction,
+// matching QmgmtSetEffectiveOwner (qmgmt.cpp ~3400-3500). Naming the
+// authenticated user itself, with or without the domain, keeps the real
+// identity, domain included (is_same_user(o, real_owner) clears o there).
+// Any other owner is honored only for super users; a name without a domain is
+// taken to be in UID_DOMAIN.
 func (t *Txn) SetEffectiveOwner(owner string) error {
 	if owner == "" {
 		return nil
 	}
-	if !t.isSuper && shortName(owner) != t.owner {
+	if t.authUser != "" && t.q.SameUser(owner, t.authUser) {
+		t.user = t.q.qualify(t.authUser)
+		t.owner = shortName(t.user)
+		return nil
+	}
+	if !t.isSuper {
 		return fmt.Errorf("user %q may not set effective owner to %q", t.authUser, owner)
 	}
-	t.owner = shortName(owner)
-	if t.q.domain != "" {
-		t.user = t.owner + "@" + t.q.domain
-	} else {
-		t.user = owner
+	if shortName(owner) == "" || isUnmapped(owner) {
+		return fmt.Errorf("effective owner %q is not a user", owner)
 	}
+	t.user = t.q.qualify(owner)
+	t.owner = shortName(t.user)
 	return nil
 }
 
@@ -183,8 +190,7 @@ func (t *Txn) DestroyCluster(c int) error {
 	for ad := range t.q.coll.Scan() {
 		if cc, _, ok := jobIDs(ad); ok && cc == c {
 			pp, _ := ad.EvaluateAttrInt("ProcId")
-			owner, _ := ad.EvaluateAttrString("Owner")
-			if err := t.checkOwner(az, c, int(pp), owner); err != nil {
+			if err := t.checkOwner(az, c, int(pp), t.q.JobUser(ad)); err != nil {
 				return err
 			}
 			procs = append(procs, int(pp))

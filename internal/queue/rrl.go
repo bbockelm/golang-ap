@@ -24,8 +24,10 @@ const idleOrderedIndex = 0
 
 // idleOrderSpec is the maintained ordered index that reproduces the C++ schedd's
 // PrioRec ordering for negotiation. Members are the idle jobs (JobStatus == 1),
-// partitioned by submitter (the User attribute, which the negotiator names as the
-// Submitter/Owner in its negotiation header), ordered within a submitter by the
+// partitioned by submitter (the Owner attribute: the negotiator names the
+// submitter owner@ACCOUNTING_DOMAIN in its negotiation header, and
+// IdleRequestGroups looks it up by the part before the last '@', as the C++
+// schedd does), ordered within a submitter by the
 // same keys as struct prio_compar in qmgmt.cpp:
 //
 //	PreJobPrio1 desc, PreJobPrio2 desc, JobPrio desc,
@@ -37,7 +39,7 @@ const idleOrderedIndex = 0
 // attributes, so this index carries no cluster signature of its own.
 func idleOrderSpec() collections.OrderSpec {
 	return collections.OrderSpec{
-		Partition: "User",
+		Partition: "Owner",
 		Where:     "JobStatus == 1",
 		Keys: []collections.SortKey{
 			{Expr: "PreJobPrio1", Desc: true},
@@ -68,7 +70,8 @@ type RequestGroup struct {
 }
 
 // IdleRequestGroups returns a lazy iterator over the RRL groups for one
-// submitter, in negotiator priority order. projection is the set of significant
+// submitter (see SubmitterCounts; only its owner part, before the last '@', is
+// used), in negotiator priority order. projection is the set of significant
 // attributes (the negotiator's AutoClusterAttrs plus the always-significant ones)
 // whose combined per-job value defines a group: a group is a maximal run of
 // consecutive idle jobs sharing a projection checksum.
@@ -82,7 +85,7 @@ type RequestGroup struct {
 // such a job is skipped at match time.
 func (q *Queue) IdleRequestGroups(submitter string, projection []string) iter.Seq[RequestGroup] {
 	return func(yield func(RequestGroup) bool) {
-		part := classad.NewStringValue(submitter)
+		part := classad.NewStringValue(shortName(submitter))
 		var cur RequestGroup
 		have := false
 		for oa := range q.coll.Ordered(idleOrderedIndex, part, collections.OrderCursor{}) {

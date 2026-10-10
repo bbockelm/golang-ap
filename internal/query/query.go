@@ -144,14 +144,19 @@ func (s *Server) buildQuery(queryAd *classad.ClassAd, authUser string) (*vm.Quer
 	}
 
 	// Only-my-jobs scoping: when the query carries MyJobs and the caller is not
-	// a queue super user, restrict to the caller's own jobs by short owner name.
+	// a queue super user, restrict to the caller's own jobs. As in the C++
+	// schedd (command_query_job_ads, schedd.cpp ~3871-3879), a fully-qualified
+	// caller is matched against the job's User and a bare one against Owner.
 	ownerClause := ""
 	if expr, ok := queryAd.Lookup("MyJobs"); ok && expr != nil {
 		mj := strings.TrimSpace(expr.String())
 		if mj != "false" && mj != "FALSE" && mj != "0" {
-			owner := shortName(authUser)
-			if owner != "" && !s.q.IsSuperUser(authUser) {
-				ownerClause = fmt.Sprintf("(Owner == %q)", owner)
+			if authUser != "" && !s.q.IsSuperUser(authUser) {
+				attr := "Owner"
+				if strings.Contains(authUser, "@") {
+					attr = "User"
+				}
+				ownerClause = fmt.Sprintf("(%s == %q)", attr, authUser)
 			}
 		}
 	}
@@ -248,13 +253,6 @@ func tallyCount(c *queue.Counts, ad *classad.ClassAd) {
 	case queue.StatusSuspended:
 		c.Suspended++
 	}
-}
-
-func shortName(user string) string {
-	if i := strings.IndexByte(user, '@'); i >= 0 {
-		return user[:i]
-	}
-	return user
 }
 
 var nowUnix = func() int64 { return time.Now().Unix() }

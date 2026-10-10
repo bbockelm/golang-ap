@@ -83,11 +83,11 @@ func (q *Queue) actOnJob(c, p int, req ActionRequest, apply bool) int {
 	if !ok {
 		return ArNotFound
 	}
-	owner, _ := ad.EvaluateAttrString("Owner")
 	if !req.System {
 		// An empty Actor is an unauthenticated tool: UserCheck2 rejects a NULL
-		// user outright, so it owns nothing (not even an Owner-less job).
-		if req.Actor == "" || (!q.IsSuperUser(req.Actor) && shortName(req.Actor) != owner) {
+		// user outright, so it owns nothing (not even an Owner-less job). The
+		// actor owns the job only if it is the job's whole user@domain.
+		if req.Actor == "" || (!q.IsSuperUser(req.Actor) && !q.SameUser(req.Actor, q.JobUser(ad))) {
 			return ArPermissionDenied
 		}
 	}

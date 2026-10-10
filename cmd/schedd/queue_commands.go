@@ -39,10 +39,12 @@ func resolveSpoolDir(cfg *config.Config) string {
 func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.Queue, error) {
 	spool := resolveSpoolDir(cfg)
 	uidDomain, _ := cfg.Get("UID_DOMAIN")
+	acctDomain, _ := cfg.Get("ACCOUNTING_DOMAIN")
 	opts := queueAuthzOptions(cfg)
 	opts.Dir = strings.TrimSpace(spool)
 	opts.ScheddName = name
 	opts.UIDDomain = strings.TrimSpace(uidDomain)
+	opts.AccountingDomain = strings.TrimSpace(acctDomain) // empty: UID_DOMAIN
 	q, err := queue.Open(opts)
 	if err != nil {
 		return nil, err

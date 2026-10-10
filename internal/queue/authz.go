@@ -113,13 +113,16 @@ func errAnonymous() error {
 }
 
 // checkOwner applies the UserCheck2 ownership rule to a committed job whose
-// Owner is owner: a queue superuser (or QUEUE_ALL_USERS_TRUSTED) may touch any
-// job, everyone else only their own. The caller has already refused anonymous.
+// User is owner: a queue superuser (or QUEUE_ALL_USERS_TRUSTED) may touch any
+// job, everyone else only their own. Ownership is the whole user@domain, as
+// the C++ schedd compares the job's and the socket's user records, so
+// alice@otherpool does not own alice@pool's jobs. The caller has already
+// refused anonymous.
 func (t *Txn) checkOwner(az authzConfig, c, p int, owner string) error {
 	if az.allUsersTrusted || t.isSuper {
 		return nil
 	}
-	if owner != "" && shortName(t.authUser) != owner {
+	if owner != "" && !t.q.SameUser(t.authUser, owner) {
 		return permErr("user %q may not modify job %d.%d owned by %q", t.authUser, c, p, owner)
 	}
 	return nil
@@ -180,23 +183,24 @@ func (t *Txn) authorize(c, p int, name string) (ignore bool, err error) {
 	return false, nil
 }
 
-// committedOwner returns the Owner of the already-committed job c.p (reading the
-// flattened proc ad, or the cluster ad for a cluster-level edit / proc whose Owner
-// is inherited). committed is false when no ad for c.p exists in the live queue
-// yet -- i.e. it is a new ad being created in the current transaction.
+// committedOwner returns the owning identity (see Queue.JobUser) of the
+// already-committed job c.p, reading the flattened proc ad, or the cluster ad
+// for a cluster-level edit / proc whose User is inherited. committed is false
+// when no ad for c.p exists in the live queue yet -- i.e. it is a new ad being
+// created in the current transaction.
 func (t *Txn) committedOwner(c, p int) (owner string, committed bool) {
 	ad, ok := t.q.coll.Get(jobKey(c, p))
 	if !ok {
 		return "", false
 	}
-	if o, ok := ad.EvaluateAttrString("Owner"); ok {
-		return o, true
+	if u := t.q.JobUser(ad); u != "" {
+		return u, true
 	}
-	// Proc ad without its own Owner: fall back to the cluster ad.
+	// Proc ad without its own User/Owner: fall back to the cluster ad.
 	if p >= 0 {
 		if cad, ok := t.q.coll.Get(jobKey(c, -1)); ok {
-			if o, ok := cad.EvaluateAttrString("Owner"); ok {
-				return o, true
+			if u := t.q.JobUser(cad); u != "" {
+				return u, true
 			}
 		}
 	}

@@ -140,3 +140,29 @@ func TestActOnJobsAuthenticated(t *testing.T) {
 		t.Errorf("alice's remove left job %d.0 in the queue", c)
 	}
 }
+
+// condor_rm compares the caller's whole user@domain with the job's User:
+// alice@otherpool may not remove alice@pool's job, condor@otherdomain is not a
+// queue superuser, and condor@family is.
+func TestActOnJobsFullName(t *testing.T) {
+	q := openQueue(t)
+	c := seedJob(t, q, "alice@pool")
+
+	for _, user := range []string{"alice@otherpool", "condor@otherdomain"} {
+		if code, super := actOnJob(t, q, conntest.Negotiation(user, true), jaRemoveJobs, c); code != queue.ArPermissionDenied || super {
+			t.Errorf("%s: code=%d super=%v, want ArPermissionDenied, false", user, code, super)
+		}
+	}
+	if _, ok := q.Get(c, 0); !ok {
+		t.Fatalf("a non-owner removed alice@pool's job")
+	}
+	if code, super := actOnJob(t, q, conntest.Negotiation("condor@family", true), jaHoldJobs, c); code != queue.ArSuccess || !super {
+		t.Errorf("condor@family hold: code=%d super=%v, want ArSuccess, true", code, super)
+	}
+	if code, _ := actOnJob(t, q, conntest.Negotiation("alice@pool", true), jaRemoveJobs, c); code != queue.ArSuccess {
+		t.Errorf("alice@pool: code=%d, want ArSuccess", code)
+	}
+	if _, ok := q.Get(c, 0); ok {
+		t.Errorf("alice@pool's remove left job %d.0 in the queue", c)
+	}
+}

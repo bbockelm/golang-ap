@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
@@ -121,4 +122,54 @@ func TestSpoolRequiresAuthenticatedOwner(t *testing.T) {
 	if !spoolFor(t, q, conntest.Negotiation("alice@pool", true), c) {
 		t.Errorf("authenticated owner failed the spool ownership check")
 	}
+}
+
+// Spooling compares the caller's whole user@domain with the job's User:
+// alice@otherpool is not alice@pool, and condor@otherdomain is not a super user.
+func TestSpoolOwnerIsTheFullName(t *testing.T) {
+	q, c := openIdentityQueue(t)
+	for _, user := range []string{"alice@otherpool", "condor@otherdomain"} {
+		neg := conntest.Negotiation(user, true)
+		if n := transferCount(t, q, neg); n != 0 {
+			t.Errorf("%s: TRANSFER_DATA offered %d of alice@pool's job(s), want 0", user, n)
+		}
+		if spoolFor(t, q, neg, c) {
+			t.Errorf("%s passed the spool ownership check for alice@pool's job", user)
+		}
+	}
+	if n := transferCount(t, q, conntest.Negotiation("condor@family", true)); n != 1 {
+		t.Errorf("condor@family: TRANSFER_DATA offered %d job(s), want 1", n)
+	}
+	if !spoolFor(t, q, conntest.Negotiation("alice@pool", true), c) {
+		t.Errorf("alice@pool failed the spool ownership check for her own job")
+	}
+}
+
+// A job whose User is in the unmapped domain has no local account: the spool
+// handlers refuse it, even to a queue super user, before any account lookup.
+func TestSpoolRefusesUnmappedOwner(t *testing.T) {
+	q, c := openIdentityQueue(t)
+	q.Modify(c, 0, func(ad *classad.ClassAd) {
+		ad.InsertAttrString("Owner", "ssl")
+		ad.InsertAttrString("User", "ssl@unmapped")
+	})
+	super := conntest.Negotiation("condor@pool", true)
+	if n := transferCount(t, q, super); n != 0 {
+		t.Errorf("TRANSFER_DATA offered %d job(s) owned by ssl@unmapped, want 0", n)
+	}
+	if spoolFor(t, q, super, c) {
+		t.Errorf("SPOOL_JOB_FILES accepted a job owned by ssl@unmapped")
+	}
+	if _, err := jobAccount(mustAd(t, q, c)); err == nil {
+		t.Errorf("jobAccount accepted a job owned by ssl@unmapped")
+	}
+}
+
+func mustAd(t *testing.T, q *queue.Queue, c int) *classad.ClassAd {
+	t.Helper()
+	ad, ok := q.Get(c, 0)
+	if !ok {
+		t.Fatalf("job %d.0 missing", c)
+	}
+	return ad
 }
