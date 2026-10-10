@@ -25,6 +25,7 @@ import (
 	hqmgmt "github.com/bbockelm/golang-htcondor/qmgmt"
 
 	"github.com/bbockelm/golang-ap/internal/factory"
+	"github.com/bbockelm/golang-ap/internal/identity"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -71,10 +72,7 @@ func New(q *queue.Queue, log *logging.Logger, spoolDir string) *Server {
 // are permitted. Returning nil closes the connection (the normal end after the
 // peer sends CloseSocket or hangs up).
 func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
-	authUser := ""
-	if c.Negotiation != nil {
-		authUser = c.Negotiation.User
-	}
+	authUser := identity.Caller(c) // "" when the peer did not authenticate
 	writable := c.Command == hqmgmt.WriteCmd
 
 	// allowProtected is a per-connection flag (like the C++ Q_SOCK's
@@ -172,7 +170,7 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 			}
 			p, err := txn.NewProc(cluster)
 			if err != nil {
-				if e := s.reply(ctx, c, -1, eINVAL); e != nil {
+				if e := s.reply(ctx, c, -1, terrnoFor(err)); e != nil {
 					return e
 				}
 				continue
@@ -256,7 +254,12 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 				_ = s.reply(ctx, c, -1, ePERM)
 				continue
 			}
-			txn.DestroyProc(cluster, proc)
+			if derr := txn.DestroyProc(cluster, proc); derr != nil {
+				if e := s.reply(ctx, c, -1, terrnoFor(derr)); e != nil {
+					return e
+				}
+				continue
+			}
 			if err := s.reply(ctx, c, 0, 0); err != nil {
 				return err
 			}
@@ -270,7 +273,12 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 				_ = s.reply(ctx, c, -1, ePERM)
 				continue
 			}
-			txn.DestroyCluster(cluster)
+			if derr := txn.DestroyCluster(cluster); derr != nil {
+				if e := s.reply(ctx, c, -1, terrnoFor(derr)); e != nil {
+					return e
+				}
+				continue
+			}
 			if err := s.reply(ctx, c, 0, 0); err != nil {
 				return err
 			}
@@ -616,11 +624,12 @@ func (s *Server) replyNewClusterErr(ctx context.Context, c *cedarserver.Conn, ce
 	if err := wm.PutInt(ctx, -1); err != nil {
 		return err
 	}
-	if err := wm.PutInt(ctx, eINVAL); err != nil {
+	terrno := terrnoFor(cerr)
+	if err := wm.PutInt(ctx, terrno); err != nil {
 		return err
 	}
 	errAd := classad.New()
-	_ = errAd.Set("ErrorCode", int64(eINVAL))
+	_ = errAd.Set("ErrorCode", int64(terrno))
 	errAd.InsertAttrString("ErrorReason", cerr.Error())
 	if err := wm.PutClassAd(ctx, errAd); err != nil {
 		return err

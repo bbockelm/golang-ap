@@ -48,7 +48,7 @@ const (
 // ActionRequest describes one condor_hold/release/rm operation.
 type ActionRequest struct {
 	Kind           ActionKind
-	Actor          string // authenticated user performing the action
+	Actor          string // authenticated user performing the action; "" = none
 	Reason         string
 	HoldReasonCode int
 	HoldReasonSub  int
@@ -84,8 +84,12 @@ func (q *Queue) actOnJob(c, p int, req ActionRequest, apply bool) int {
 		return ArNotFound
 	}
 	owner, _ := ad.EvaluateAttrString("Owner")
-	if !req.System && !q.IsSuperUser(req.Actor) && shortName(req.Actor) != owner {
-		return ArPermissionDenied
+	if !req.System {
+		// An empty Actor is an unauthenticated tool: UserCheck2 rejects a NULL
+		// user outright, so it owns nothing (not even an Owner-less job).
+		if req.Actor == "" || (!q.IsSuperUser(req.Actor) && shortName(req.Actor) != owner) {
+			return ArPermissionDenied
+		}
 	}
 	st, _ := ad.EvaluateAttrInt("JobStatus")
 	status := int(st)

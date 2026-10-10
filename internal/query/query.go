@@ -20,6 +20,7 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	"github.com/bbockelm/golang-ap/internal/identity"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -45,10 +46,7 @@ func (s *Server) Handle(ctx context.Context, c *cedarserver.Conn) error {
 		return fmt.Errorf("reading query ad: %w", err)
 	}
 
-	authUser := ""
-	if c.Negotiation != nil {
-		authUser = c.Negotiation.User
-	}
+	authUser := identity.Caller(c) // "" when the peer did not authenticate
 
 	query, projection := s.buildQuery(queryAd, authUser)
 	sendServerTime := true

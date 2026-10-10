@@ -100,6 +100,31 @@ func permErr(format string, args ...any) error {
 	return &AuthzError{msg: fmt.Sprintf(format, args...)}
 }
 
+// anonymous reports whether the transaction has no authenticated identity: the
+// QMGMT connection did not authenticate (identity.Caller returned ""). Such a
+// transaction may read but never write, matching the C++ schedd, where
+// SetAttribute requires Q_SOCK->isAuthenticated() and UserCheck2 rejects a
+// NULL user ("anonymous user not permitted") -- even with QUEUE_ALL_USERS_TRUSTED,
+// since the SetAttribute gate precedes that knob.
+func (t *Txn) anonymous() bool { return t.authUser == "" }
+
+func errAnonymous() error {
+	return permErr("authentication is required to modify the job queue")
+}
+
+// checkOwner applies the UserCheck2 ownership rule to a committed job whose
+// Owner is owner: a queue superuser (or QUEUE_ALL_USERS_TRUSTED) may touch any
+// job, everyone else only their own. The caller has already refused anonymous.
+func (t *Txn) checkOwner(az authzConfig, c, p int, owner string) error {
+	if az.allUsersTrusted || t.isSuper {
+		return nil
+	}
+	if owner != "" && shortName(t.authUser) != owner {
+		return permErr("user %q may not modify job %d.%d owned by %q", t.authUser, c, p, owner)
+	}
+	return nil
+}
+
 // authorize applies the per-attribute / ownership rules to a client attempt to
 // set or delete attribute name on job c.p. It returns (ignore=true, nil) when the
 // write should be silently dropped (a secure-attr set with the ignore knob on),
@@ -108,6 +133,9 @@ func permErr(format string, args ...any) error {
 // internal writes never call this (they use Queue.Modify / coll.Update directly),
 // so this only ever runs for a client-driven Txn.SetAttribute/DeleteAttribute.
 func (t *Txn) authorize(c, p int, name string) (ignore bool, err error) {
+	if t.anonymous() {
+		return false, errAnonymous()
+	}
 	az := t.q.authzSnapshot()
 	lname := strings.ToLower(name)
 
@@ -131,11 +159,8 @@ func (t *Txn) authorize(c, p int, name string) (ignore bool, err error) {
 
 	// Ownership: a non-superuser may only touch a committed job they own. Skipped
 	// when QUEUE_ALL_USERS_TRUSTED (qmgmt_all_users_trusted) is set.
-	if !az.allUsersTrusted && !t.isSuper {
-		if committedOwner != "" && shortName(t.authUser) != committedOwner {
-			return false, permErr("user %q may not change attributes for job %d.%d owned by %q",
-				t.authUser, c, p, committedOwner)
-		}
+	if err := t.checkOwner(az, c, p, committedOwner); err != nil {
+		return false, err
 	}
 
 	// Immutable: rejected for every client, including superusers, on a committed

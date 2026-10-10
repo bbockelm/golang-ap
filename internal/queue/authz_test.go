@@ -3,6 +3,8 @@ package queue
 import (
 	"errors"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // openAuthzQueue opens a queue with custom authorization options for the
@@ -277,5 +279,114 @@ func TestSetAuthzLiveReconfig(t *testing.T) {
 	// The newly-immutable attribute is now rejected for everyone, including supers.
 	if err := q.Begin("condor").SetAttribute(c, 0, "LockMe", `"y"`); !isAuthzErr(err) {
 		t.Fatalf("setting newly-immutable attr after reconfig: want AuthzError, got %v", err)
+	}
+}
+
+// A transaction with no authenticated identity (Begin("")) can write nothing:
+// not submit, not edit, not destroy, not act on a job -- even an Owner-matching
+// or all-users-trusted check must not let it through, matching the C++ schedd's
+// SetAttribute authentication gate and UserCheck2's anonymous rejection.
+func TestAuthzAnonymousRefused(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		q := openAuthzQueue(t, Options{AllUsersTrusted: trusted})
+		c := submitCluster(t, q, "alice", 1)
+
+		anon := q.Begin("")
+		if _, err := anon.NewCluster(); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous NewCluster: want AuthzError, got %v", trusted, err)
+		}
+		if _, err := anon.NewProc(c); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous NewProc: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.SetAttribute(c, 0, "Foo", `"bar"`); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous SetAttribute: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.DeleteAttribute(c, 0, "Args"); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous DeleteAttribute: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.DestroyProc(c, 0); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous DestroyProc: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.DestroyCluster(c); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous DestroyCluster: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.Commit(); err != nil {
+			t.Errorf("trusted=%v: anonymous empty commit: %v", trusted, err)
+		}
+		if _, ok := q.Get(c, 0); !ok {
+			t.Fatalf("trusted=%v: anonymous transaction removed job %d.0", trusted, c)
+		}
+		if got := q.CheckAction(c, 0, ActionRequest{Kind: ActRemove, Actor: ""}); got != ArPermissionDenied {
+			t.Errorf("trusted=%v: anonymous remove: got %d, want ArPermissionDenied", trusted, got)
+		}
+
+		// A job whose Owner is empty (what an anonymous submit used to commit)
+		// matches the empty short name, so only the anonymous check refuses it.
+		ownerless := submitCluster(t, q, "alice", 1)
+		q.Modify(ownerless, 0, func(ad *classad.ClassAd) { ad.InsertAttrString("Owner", "") })
+		anon = q.Begin("")
+		if err := anon.SetAttribute(ownerless, 0, "Foo", `"bar"`); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous SetAttribute on Owner-less job: want AuthzError, got %v", trusted, err)
+		}
+		if err := anon.DestroyProc(ownerless, 0); !isAuthzErr(err) {
+			t.Errorf("trusted=%v: anonymous DestroyProc on Owner-less job: want AuthzError, got %v", trusted, err)
+		}
+		if got := q.CheckAction(ownerless, 0, ActionRequest{Kind: ActRemove, Actor: ""}); got != ArPermissionDenied {
+			t.Errorf("trusted=%v: anonymous remove of Owner-less job: got %d, want ArPermissionDenied", trusted, got)
+		}
+		if got := q.CheckAction(ownerless, 0, ActionRequest{Kind: ActRemove, Actor: "condor"}); got != ArSuccess {
+			t.Errorf("trusted=%v: superuser remove of Owner-less job: got %d, want ArSuccess", trusted, got)
+		}
+		_ = q.Close()
+	}
+}
+
+// QMGMT DestroyProc / DestroyCluster are owner-checked like SetAttribute: a
+// non-owner is refused, the owner and a queue superuser are not.
+func TestAuthzDestroyOwnership(t *testing.T) {
+	q := openTestQueue(t, t.TempDir())
+	defer func() { _ = q.Close() }()
+	c := submitCluster(t, q, "alice", 2)
+
+	bob := q.Begin("bob")
+	if err := bob.DestroyProc(c, 0); !isAuthzErr(err) {
+		t.Fatalf("bob DestroyProc on alice's job: want AuthzError, got %v", err)
+	}
+	if err := bob.DestroyCluster(c); !isAuthzErr(err) {
+		t.Fatalf("bob DestroyCluster on alice's cluster: want AuthzError, got %v", err)
+	}
+	if err := bob.Commit(); err != nil {
+		t.Fatalf("bob commit: %v", err)
+	}
+	if _, ok := q.Get(c, 0); !ok {
+		t.Fatalf("bob's refused destroy removed %d.0", c)
+	}
+
+	alice := q.Begin("alice")
+	if err := alice.DestroyProc(c, 0); err != nil {
+		t.Fatalf("alice DestroyProc on her own job: %v", err)
+	}
+	if err := alice.Commit(); err != nil {
+		t.Fatalf("alice commit: %v", err)
+	}
+	if _, ok := q.Get(c, 0); ok {
+		t.Fatalf("alice's DestroyProc left %d.0", c)
+	}
+
+	// DestroyCluster checks every committed proc, not only the cluster ad.
+	q.Modify(c, 1, func(ad *classad.ClassAd) { ad.InsertAttrString("Owner", "bob") })
+	if err := q.Begin("alice").DestroyCluster(c); !isAuthzErr(err) {
+		t.Fatalf("alice DestroyCluster over bob's proc: want AuthzError, got %v", err)
+	}
+
+	super := q.Begin("condor")
+	if err := super.DestroyCluster(c); err != nil {
+		t.Fatalf("superuser DestroyCluster: %v", err)
+	}
+	if err := super.Commit(); err != nil {
+		t.Fatalf("superuser commit: %v", err)
+	}
+	if _, ok := q.Get(c, 1); ok {
+		t.Fatalf("superuser DestroyCluster left %d.1", c)
 	}
 }
