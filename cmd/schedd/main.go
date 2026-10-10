@@ -25,7 +25,6 @@ import (
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/droppriv"
@@ -88,9 +87,22 @@ func run() error {
 	// Route cedar's security/server slog output into ScheddLog.
 	slog.SetDefault(d.Slog())
 
+	// Command-socket listener: the shared-port endpoint inherited from
+	// condor_master if present, otherwise a plain TCP bind. Under USE_SHARED_PORT
+	// (required) the fallback is not used in practice. Resolved before the
+	// security config, which needs the shared-port id.
+	ln, err := d.Listener(func() (net.Listener, error) {
+		return net.Listen("tcp", *listen)
+	})
+	if err != nil {
+		log.Error(logging.DestinationGeneral, "listener setup failed", "err", err.Error())
+		return err
+	}
+	defer func() { _ = ln.Close() }()
+
 	// Server-side security policy from the HTCondor configuration (SEC_* knobs),
 	// so this schedd authenticates and encrypts exactly like the C++ one.
-	sec, err := htcondor.GetServerSecurityConfig(d.Config(), commands.QUERY_SCHEDD_ADS, "DAEMON")
+	sec, err := d.ServerSecurityConfig(commands.QUERY_SCHEDD_ADS, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
@@ -103,27 +115,6 @@ func run() error {
 		sec.RemoteVersion = detectCondorVersion()
 	}
 
-	// Command-socket listener: the shared-port endpoint inherited from
-	// condor_master if present, otherwise a plain TCP bind. Under USE_SHARED_PORT
-	// (required) the fallback is not used in practice. Resolved before the
-	// security config is finished, which needs the shared-port id.
-	ln, err := d.Listener(func() (net.Listener, error) {
-		return net.Listen("tcp", *listen)
-	})
-	if err != nil {
-		log.Error(logging.DestinationGeneral, "listener setup failed", "err", err.Error())
-		return err
-	}
-	defer func() { _ = ln.Close() }()
-
-	// Peer identities are user@domain; a peer that authenticates without a
-	// domain of its own (FS, CLAIMTOBE) is in UID_DOMAIN. Behind shared port,
-	// FS channel binding checks a client-reported sock id against ours.
-	if uid, ok := cfg.Get("UID_DOMAIN"); ok {
-		sec.UIDDomain = strings.TrimSpace(uid)
-	}
-	sec.SharedPortID = d.SharedPortName()
-
 	// Share one session cache between the command server and the match table so
 	// startd keepalives (ALIVE) that resume a claim-derived session are recognized
 	// by the server and renew the right match's lease.
@@ -134,11 +125,11 @@ func run() error {
 	// ALLOW_<level>/DENY_<level> authorization for every command on the
 	// socket, each negotiated at its own level's SEC_<level>_* policy, as the
 	// C++ schedd's DaemonCore does. The policy is rebuilt on reconfig.
-	az, err := newScheddAuthz(d.Config())
+	az, err := d.NewAuthz(authzOptions())
 	if err != nil {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
-	if err := installAuthz(srv, az, d.Config(), sec); err != nil {
+	if err := installAuthz(srv, az, sec, d.ServerSecurityConfig); err != nil {
 		return fmt.Errorf("building per-level security config: %w", err)
 	}
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon, and
@@ -389,7 +380,7 @@ func run() error {
 	// components (see reconfigure). Registered before Start so a reconfig that
 	// races startup still lands on live components.
 	d.OnReconfig(func(newCfg *config.Config) {
-		reconfigure(newCfg, log, scheduler, matEngine, jobQueue, az)
+		reconfigure(newCfg, log, scheduler, matEngine, jobQueue)
 	})
 
 	scheduler.Start(ctx)
@@ -409,7 +400,7 @@ func run() error {
 	log.Info(logging.DestinationGeneral, "golang-ap schedd starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster(), "name", scheddName(cfg, *localName))
 
-	return d.Serve(ctx, ln, serveCommands(srv, az, d.Slog()))
+	return d.Serve(ctx, ln, az.Serve(srv, d.Slog()))
 }
 
 // reconfigure re-reads the reconfigurable SCHEDD_* knobs (from the freshly
@@ -425,7 +416,9 @@ func run() error {
 //   - SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON/_SUBCODE) -> recompiled policy
 //   - QUEUE_SUPER_USERS, IMMUTABLE/PROTECTED/SECURE_JOB_ATTRS,
 //     QUEUE_ALL_USERS_TRUSTED, IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS -> queue authz
-//   - ALLOW_<level>/DENY_<level>  -> command authorization policy
+//
+// The ALLOW_<level>/DENY_<level> command authorization policy is rebuilt by
+// the reconfig callback d.NewAuthz registered, not here.
 //
 // Still startup-only (documented, not reconfigured here): the listener / shared-port
 // endpoint and command address, SCHEDD_NAME, UID_DOMAIN, the security policy
@@ -433,15 +426,12 @@ func run() error {
 // worker-pool sizing (SCHEDD_USERLOG_*), the privsep mode, SCHEDD_RECONNECT, and the
 // spool/queue location.
 func reconfigure(cfg *config.Config, log *logging.Logger, scheduler *sched.Scheduler,
-	matEngine *factory.Engine, jobQueue *queue.Queue, az *scheddAuthz) {
+	matEngine *factory.Engine, jobQueue *queue.Queue) {
 	scheduler.SetAdvertiseInterval(configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second))
 	scheduler.SetPeriodicInterval(configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval))
 	scheduler.SetSysPolicy(buildSysPolicy(cfg))
 	matEngine.SetInterval(configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
 	jobQueue.SetAuthz(queueAuthzOptions(cfg))
-	if err := az.reload(cfg); err != nil {
-		log.Error(logging.DestinationSecurity, "reloading authorization policy failed; keeping the previous one", "err", err.Error())
-	}
 	log.Info(logging.DestinationGeneral, "reconfig applied: schedd knobs re-read",
 		"schedd_interval", configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second).String(),
 		"periodic_expr_interval", configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval).String(),
