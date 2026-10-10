@@ -166,7 +166,8 @@ func TestShadowVanillaRun(t *testing.T) {
 		t.Fatalf("register_starter_info rval=%d", rval)
 	}
 
-	// (3) get_sec_session_info: shadow declines with rval<0 (stage 3).
+	// (3) get_sec_session_info: no claim id, so no session to hand over; the
+	// shadow declines with rval<0.
 	{
 		in := fs.call(ctx, opGetSecSessionInfo, func(m *message.Message) error {
 			if err := m.PutString(ctx, ""); err != nil {
@@ -179,7 +180,7 @@ func TestShadowVanillaRun(t *testing.T) {
 			t.Fatalf("get_sec_session_info rval: %v", err)
 		}
 		if rval >= 0 {
-			t.Fatalf("get_sec_session_info rval=%d, want <0 in stage 3", rval)
+			t.Fatalf("get_sec_session_info rval=%d, want <0 without a claim session", rval)
 		}
 		if terrno, err := in.GetInt(ctx); err != nil {
 			t.Fatalf("get_sec_session_info terrno: %v", err)

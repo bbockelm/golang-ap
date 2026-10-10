@@ -60,17 +60,15 @@ const (
 )
 
 // NewReconnect builds a reconnect-mode Shadow: one with no syscall stream yet
-// (RunReconnect establishes it via the CA_RECONNECT_JOB handshake). File
-// transfer is mandatory here -- the reconnect handshake must hand the starter a
-// fresh TransferKey/TransferSocket -- so a TransferEndpoint and ClaimID are
-// required. It sets up the transfer route (and imports the derived filetrans
-// session) exactly like New; RunReconnect then dials the starter and serves.
+// (RunReconnect establishes it via the CA_RECONNECT_JOB handshake). A ClaimID
+// is required: its session authenticates the handshake. With a
+// TransferEndpoint it sets up a fresh transfer route, handed to the starter
+// as TransferKey/TransferSocket, exactly like New; without one the request
+// carries none, as a C++ shadow's does when it has no transfer key.
+// RunReconnect then dials the starter and serves.
 func NewReconnect(cfg Config) (*Shadow, error) {
 	if cfg.JobAd == nil {
 		return nil, fmt.Errorf("shadow: reconnect config requires a job ad")
-	}
-	if cfg.TransferEndpoint == nil {
-		return nil, fmt.Errorf("shadow: reconnect requires a transfer endpoint")
 	}
 	if cfg.ClaimID == "" {
 		return nil, fmt.Errorf("shadow: reconnect requires a claim id")
@@ -78,6 +76,9 @@ func NewReconnect(cfg Config) (*Shadow, error) {
 	s := &Shadow{
 		cfg:      cfg,
 		jobAttrs: make(map[string]string),
+	}
+	if err := s.setupClaimSessions(); err != nil {
+		return nil, err
 	}
 	ts, err := s.setupTransfer()
 	if err != nil {

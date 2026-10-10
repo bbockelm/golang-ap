@@ -321,11 +321,17 @@ func (ep *Endpoint) doDownload(ctx context.Context, c *cedarserver.Conn) error {
 // transferState is the per-shadow file-transfer setup, created in setupTransfer
 // when a TransferEndpoint and ClaimID are configured.
 type transferState struct {
-	endpoint         *Endpoint
-	transKey         string
-	transSocket      string
-	reconnectSession sessionMaterial
-	filetransSession sessionMaterial
+	endpoint    *Endpoint
+	transKey    string
+	transSocket string
+}
+
+// claimSessions is the session material get_sec_session_info hands the
+// starter: the reconnect session and the filetrans session, both derived from
+// the claim id.
+type claimSessions struct {
+	reconnect sessionMaterial
+	filetrans sessionMaterial
 }
 
 // sessionMaterial is the {id, info, key} triple get_sec_session_info returns for
@@ -336,11 +342,55 @@ type sessionMaterial struct {
 	key  string
 }
 
-// setupTransfer wires the shadow for file transfer: it derives the reconnect and
-// filetrans sessions from the claim id, imports the filetrans session into the
-// endpoint's cache (so the starter's inbound resumption is recognized), builds
-// the input plan and output sink from the job ad, and registers the route under
-// a freshly generated TransferKey. It returns the state (nil if transfer is not
+// setupClaimSessions derives the reconnect and filetrans sessions from the
+// claim id, as RemoteResource::setStartdInfo does for every claim that carries
+// a security session whether or not the job transfers files, so
+// get_sec_session_info can hand them to the starter and the starter can accept
+// a later reconnect. The filetrans session is registered in the transfer
+// endpoint's cache, where the starter's FILETRANS_* connection resumes it, or
+// in a private cache when there is no endpoint. A claim id without a session
+// leaves s.sessions nil (the C++ shadow then declines get_sec_session_info).
+func (s *Shadow) setupClaimSessions() error {
+	cid := security.ParseClaimIDStrict(s.cfg.ClaimID)
+	baseID := cid.SecSessionID()
+	if baseID == "" {
+		return nil
+	}
+	cache := security.NewSessionCache()
+	if s.cfg.TransferEndpoint != nil {
+		cache = s.cfg.TransferEndpoint.Cache()
+	}
+	// Same id/key derivation the starter uses via
+	// CreateNonNegotiatedSecuritySession.
+	ftID, err := security.ImportFileTransferSession(cache, s.cfg.ClaimID, security.ClaimSessionOptions{
+		PeerFQU: security.ExecuteSideMatchSessionFQU,
+	})
+	if err != nil {
+		return fmt.Errorf("shadow: import filetrans session: %w", err)
+	}
+	// The reconnect session is the claim session itself (remoteresource.cpp
+	// uses m_claim_session): stable across shadow restarts. The filetrans
+	// session carries the shadow's own WRITE policy (encryption + integrity +
+	// AES).
+	s.sessions = &claimSessions{
+		reconnect: sessionMaterial{
+			id:   baseID,
+			info: cid.SecSessionInfo(),
+			key:  cid.SecSessionKey(),
+		},
+		filetrans: sessionMaterial{
+			id:   ftID,
+			info: `[Encryption="YES";Integrity="YES";CryptoMethods="AES";]`,
+			key:  cid.SecSessionKey(),
+		},
+	}
+	return nil
+}
+
+// setupTransfer wires the shadow for file transfer: it builds the input plan
+// and output sink from the job ad and registers the route under a freshly
+// generated TransferKey on the endpoint, whose cache setupClaimSessions put the
+// filetrans session in. It returns the state (nil if transfer is not
 // configured).
 func (s *Shadow) setupTransfer() (*transferState, error) {
 	if s.cfg.TransferEndpoint == nil {
@@ -349,22 +399,10 @@ func (s *Shadow) setupTransfer() (*transferState, error) {
 	if s.cfg.ClaimID == "" {
 		return nil, fmt.Errorf("shadow: file transfer requires Config.ClaimID")
 	}
-	ep := s.cfg.TransferEndpoint
-	cid := security.ParseClaimIDStrict(s.cfg.ClaimID)
-	baseID := cid.SecSessionID()
-	if baseID == "" {
+	if s.sessions == nil {
 		return nil, fmt.Errorf("shadow: claim id carries no security session")
 	}
-
-	// Register the derived filetrans session in the endpoint's cache so the
-	// starter's session-resumed FILETRANS_* connection resumes it. Same id/key
-	// derivation the starter uses via CreateNonNegotiatedSecuritySession.
-	ftID, err := security.ImportFileTransferSession(ep.Cache(), s.cfg.ClaimID, security.ClaimSessionOptions{
-		PeerFQU: security.ExecuteSideMatchSessionFQU,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("shadow: import filetrans session: %w", err)
-	}
+	ep := s.cfg.TransferEndpoint
 
 	plan, err := s.buildInputPlan()
 	if err != nil {
@@ -399,24 +437,10 @@ func (s *Shadow) setupTransfer() (*transferState, error) {
 		spooled: spooled, cluster: int(cluster64), proc: int(proc64),
 	})
 
-	// Session material handed to the starter in get_sec_session_info. The
-	// reconnect session is the claim session itself (remoteresource.cpp uses
-	// m_claim_session); the filetrans session carries the shadow's own WRITE
-	// policy (encryption + integrity + AES).
 	st := &transferState{
 		endpoint:    ep,
 		transKey:    key,
 		transSocket: ep.Sinful(),
-		reconnectSession: sessionMaterial{
-			id:   baseID,
-			info: cid.SecSessionInfo(),
-			key:  cid.SecSessionKey(),
-		},
-		filetransSession: sessionMaterial{
-			id:   ftID,
-			info: `[Encryption="YES";Integrity="YES";CryptoMethods="AES";]`,
-			key:  cid.SecSessionKey(),
-		},
 	}
 	return st, nil
 }
