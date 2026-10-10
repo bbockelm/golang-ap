@@ -7,34 +7,49 @@ import (
 // SubmitterCount holds one submitter's live job tallies for the Submitter ad the
 // schedd advertises so the negotiator will negotiate for it.
 type SubmitterCount struct {
-	// Name is the fully-qualified submitter identity (the queue's User attribute,
-	// e.g. "alice@example.com"); it is the ATTR_NAME the negotiator keys on.
+	// Name is the submitter name the negotiator keys on: the owner at the
+	// ACCOUNTING_DOMAIN (e.g. "alice@example.com").
 	Name string
-	// Owner is the bare owner short name (for the negotiator's owner match).
+	// Owner is the bare owner name the submitter's jobs carry.
 	Owner         string
 	Idle, Running int
 	Held, Removed int
 	Total         int
 }
 
-// SubmitterCounts scans the live queue and tallies jobs per submitter (keyed by
-// the User attribute, falling back to Owner when User is unset). The schedd
-// advertises one Submitter ad per returned entry.
+// jobOwner returns the bare owner name a job is negotiated under: its Owner,
+// or the user part of its User. The C++ schedd takes the submitter from the
+// user part of the job's User (get_submitter_and_owner, schedd.cpp
+// ~5217-5233), which is what Begin stores as Owner.
+func (q *Queue) jobOwner(ad *classad.ClassAd) string {
+	if o, ok := ad.EvaluateAttrString("Owner"); ok && o != "" {
+		return o
+	}
+	return shortName(q.JobUser(ad))
+}
+
+// submitterName returns the submitter name advertised for owner:
+// owner@ACCOUNTING_DOMAIN, as the C++ schedd names its Submitter ads
+// (schedd.cpp ~1593-1596; ACCOUNTING_DOMAIN defaults to $(UID_DOMAIN) in
+// param_info.in). Jobs of alice@pool and alice@otherpool are both alice's
+// submitter, as in C++. With neither domain configured it is the bare owner.
+func (q *Queue) submitterName(owner string) string {
+	if q.acctDomain == "" {
+		return owner
+	}
+	return owner + "@" + q.acctDomain
+}
+
+// SubmitterCounts scans the live queue and tallies jobs per submitter (see
+// submitterName). The schedd advertises one Submitter ad per returned entry.
 func (q *Queue) SubmitterCounts() []SubmitterCount {
 	byName := map[string]*SubmitterCount{}
 	for ad := range q.coll.Scan() {
-		name, _ := ad.EvaluateAttrString("User")
-		owner, _ := ad.EvaluateAttrString("Owner")
-		if name == "" {
-			if owner != "" && q.domain != "" {
-				name = owner + "@" + q.domain
-			} else {
-				name = owner
-			}
-		}
-		if name == "" {
+		owner := q.jobOwner(ad)
+		if owner == "" {
 			continue
 		}
+		name := q.submitterName(owner)
 		sc := byName[name]
 		if sc == nil {
 			sc = &SubmitterCount{Name: name, Owner: owner}
@@ -61,19 +76,18 @@ func (q *Queue) SubmitterCounts() []SubmitterCount {
 }
 
 // IdleJobsForSubmitter returns the flattened proc ads that are Idle and belong to
-// the given submitter (matched by User == submitter, or by short Owner name as a
-// fallback). The negotiate handler turns these into resource-request job ads.
+// the given submitter: the jobs whose owner is the submitter name's user part.
+// The C++ schedd likewise truncates the negotiator's submitter at its last '@'
+// before looking it up (schedd.cpp ~9534-9541).
 func (q *Queue) IdleJobsForSubmitter(submitter string) []*classad.ClassAd {
-	short := shortName(submitter)
+	owner := shortName(submitter)
 	var out []*classad.ClassAd
 	for ad := range q.coll.Scan() {
 		st, _ := ad.EvaluateAttrInt("JobStatus")
 		if int(st) != StatusIdle {
 			continue
 		}
-		user, _ := ad.EvaluateAttrString("User")
-		owner, _ := ad.EvaluateAttrString("Owner")
-		if user == submitter || owner == short || owner == submitter {
+		if q.jobOwner(ad) == owner {
 			out = append(out, ad)
 		}
 	}

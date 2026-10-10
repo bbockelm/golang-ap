@@ -48,6 +48,12 @@ func seedJob(t *testing.T, q *queue.Queue, owner string) {
 // real handler and returns the sorted Owner of every job ad returned.
 func myJobsOwners(t *testing.T, q *queue.Queue, neg *security.SecurityNegotiation) []string {
 	t.Helper()
+	return myJobsAttr(t, q, neg, "Owner")
+}
+
+// myJobsAttr is myJobsOwners returning attribute attr of every job ad.
+func myJobsAttr(t *testing.T, q *queue.Queue, neg *security.SecurityNegotiation, attr string) []string {
+	t.Helper()
 	ctx := context.Background()
 	s, done := conntest.Serve(t, int(commands.QUERY_JOB_ADS), neg, New(q, conntest.Logger(t)).Handle)
 
@@ -70,7 +76,7 @@ func myJobsOwners(t *testing.T, q *queue.Queue, neg *security.SecurityNegotiatio
 		if mt, _ := ad.EvaluateAttrString("MyType"); mt == "Summary" {
 			break
 		}
-		o, _ := ad.EvaluateAttrString("Owner")
+		o, _ := ad.EvaluateAttrString(attr)
 		owners = append(owners, o)
 	}
 	if err := <-done; err != nil {
@@ -102,5 +108,29 @@ func TestQueryMyJobsIdentity(t *testing.T) {
 	}
 	if got, want := myJobsOwners(t, q, conntest.Negotiation("bob@pool", true)), []string{"bob"}; !slices.Equal(got, want) {
 		t.Errorf("authenticated bob: owners %v, want %v", got, want)
+	}
+}
+
+// MyJobs scopes to the caller's whole user@domain: alice@pool sees her jobs
+// and not alice@otherpool's, though both carry Owner alice. A queue super user
+// sees every job; condor@<other domain> is not one.
+func TestQueryMyJobsFullName(t *testing.T) {
+	q := openQueue(t)
+	seedJob(t, q, "alice@pool")
+	seedJob(t, q, "alice@otherpool")
+	seedJob(t, q, "bob@pool")
+	all := []string{"alice@otherpool", "alice@pool", "bob@pool"}
+
+	for user, want := range map[string][]string{
+		"alice@pool":         {"alice@pool"},
+		"alice@otherpool":    {"alice@otherpool"},
+		"alice@elsewhere":    nil,
+		"condor@otherdomain": nil,
+		"condor@pool":        all,
+		"condor@family":      all,
+	} {
+		if got := myJobsAttr(t, q, conntest.Negotiation(user, true), "User"); !slices.Equal(got, want) {
+			t.Errorf("MyJobs as %s: users %v, want %v", user, got, want)
+		}
 	}
 }

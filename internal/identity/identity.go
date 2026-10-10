@@ -21,36 +21,28 @@ import (
 	cedarserver "github.com/bbockelm/cedar/server"
 )
 
-// HTCondor's placeholder names for a peer without a mapped identity
-// (UNAUTHENTICATED_USER / UNMAPPED_DOMAIN, src/condor_io/authentication.cpp).
-const (
-	unauthenticatedUser = "unauthenticated"
-	unmappedDomain      = "unmapped"
-)
+// HTCondor's placeholder user name for a peer without a mapped identity
+// (UNAUTHENTICATED_USER, src/condor_io/authentication.cpp).
+const unauthenticatedUser = "unauthenticated"
 
-// Caller returns the authenticated identity of the peer on c, or "" when the
-// connection has none. "" means anonymous: callers must refuse anything that
-// needs an owner and must not match it against a job's Owner or the queue
-// super users.
+// Caller returns the authenticated identity of the peer on c, the full
+// user@domain HTCondor gives it (e.g. alice@pool for an IDTOKEN, owner@UID_DOMAIN
+// for FS), or "" when the connection has none. "" means anonymous: callers must
+// refuse anything that needs an owner and must not match it against a job's
+// User or the queue super users.
+//
+// It starts from the identity cedar authorizes the peer as, which is
+// unauthenticated@unmapped for a session that did not authenticate
+// (cedarserver.Conn.AuthorizationUser), and refuses every name in the
+// "unmapped" domain: an SSL or SciTokens peer no map file named (ssl@unmapped,
+// scitokens@unmapped) is not a local account.
 func Caller(c *cedarserver.Conn) string {
 	if c == nil {
 		return ""
 	}
-	return FromNegotiation(c.Negotiation)
-}
-
-// FromNegotiation returns n's user only when the negotiation actually
-// authenticated the peer and the user is a mapped identity; otherwise "".
-func FromNegotiation(n *security.SecurityNegotiation) string {
-	if n == nil || !n.Authentication {
-		return ""
-	}
-	user := strings.TrimSpace(n.User)
-	if user == "" {
-		return ""
-	}
-	name, domain, _ := strings.Cut(user, "@")
-	if name == "" || strings.EqualFold(name, unauthenticatedUser) || strings.EqualFold(domain, unmappedDomain) {
+	user := strings.TrimSpace(c.AuthorizationUser())
+	name, domain := security.SplitFQU(user)
+	if name == "" || strings.EqualFold(name, unauthenticatedUser) || strings.EqualFold(domain, security.UnmappedDomain) {
 		return ""
 	}
 	return user

@@ -374,7 +374,10 @@ func TestAuthzDestroyOwnership(t *testing.T) {
 	}
 
 	// DestroyCluster checks every committed proc, not only the cluster ad.
-	q.Modify(c, 1, func(ad *classad.ClassAd) { ad.InsertAttrString("Owner", "bob") })
+	q.Modify(c, 1, func(ad *classad.ClassAd) {
+		ad.InsertAttrString("Owner", "bob")
+		ad.InsertAttrString("User", "bob@example.net")
+	})
 	if err := q.Begin("alice").DestroyCluster(c); !isAuthzErr(err) {
 		t.Fatalf("alice DestroyCluster over bob's proc: want AuthzError, got %v", err)
 	}

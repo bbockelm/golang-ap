@@ -21,6 +21,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/bbockelm/cedar/security"
 )
 
 // JobStatus values (HTCondor's JobStatus attribute).
@@ -45,10 +46,14 @@ type Options struct {
 	Dir string
 	// ScheddName is used to build each job's GlobalJobId.
 	ScheddName string
-	// UIDDomain is appended to the owner to form the User attribute.
+	// UIDDomain is UID_DOMAIN: the domain of a user named without one.
 	UIDDomain string
+	// AccountingDomain is ACCOUNTING_DOMAIN, the domain of the submitter
+	// names the schedd advertises. Empty means UIDDomain.
+	AccountingDomain string
 	// SuperUsers are the QUEUE_SUPER_USERS who may set Owner/User to another
-	// identity and use SetEffectiveOwner.
+	// identity and use SetEffectiveOwner. An entry without a domain names
+	// that user in UIDDomain.
 	SuperUsers []string
 
 	// ImmutableAttrs / ProtectedAttrs / SecureAttrs are operator-supplied extra
@@ -75,17 +80,18 @@ type Options struct {
 // by mu. Per-connection transactions (see Begin) stage their edits privately and
 // commit as one atomic batch.
 type Queue struct {
-	coll   *collections.Collection
-	hist   *History
-	name   string
-	domain string
+	coll       *collections.Collection
+	hist       *History
+	name       string
+	domain     string // UID_DOMAIN
+	acctDomain string // ACCOUNTING_DOMAIN
 
 	// authzMu guards supers + authz so condor_reconfig can swap the QUEUE_SUPER_USERS
 	// / *_JOB_ATTRS / QUEUE_ALL_USERS_TRUSTED authorization live while QMGMT handler
 	// goroutines read it (see SetAuthz / authzSnapshot / IsSuperUser).
 	authzMu sync.RWMutex
-	supers  map[string]bool
-	authz   authzConfig // per-attribute / ownership QMGMT authorization (see authz.go)
+	supers  map[string]bool // canonical user@domain (see canonicalUser)
+	authz   authzConfig     // per-attribute / ownership QMGMT authorization (see authz.go)
 
 	mu     sync.Mutex // guards nextID + counter persistence + factories set
 	nextID int
@@ -137,21 +143,20 @@ func Open(opts Options) (*Queue, error) {
 		_ = coll.Close()
 		return nil, fmt.Errorf("opening job history: %w", err)
 	}
-	supers := map[string]bool{}
-	for _, s := range opts.SuperUsers {
-		if s = strings.TrimSpace(s); s != "" {
-			supers[s] = true
-		}
+	acctDomain := opts.AccountingDomain
+	if acctDomain == "" {
+		acctDomain = opts.UIDDomain
 	}
 	q := &Queue{
-		coll:   coll,
-		hist:   hist,
-		name:   opts.ScheddName,
-		domain: opts.UIDDomain,
-		supers: supers,
-		authz:  buildAuthzConfig(opts),
-		nextID: 1,
+		coll:       coll,
+		hist:       hist,
+		name:       opts.ScheddName,
+		domain:     opts.UIDDomain,
+		acctDomain: acctDomain,
+		authz:      buildAuthzConfig(opts),
+		nextID:     1,
 	}
+	q.supers = q.buildSupers(opts.SuperUsers)
 	// Recover the cluster-id counter.
 	if ad, ok := coll.Get([]byte(counterKey)); ok {
 		if v, ok := ad.EvaluateAttrInt("NextClusterId"); ok && int(v) > q.nextID {
@@ -178,11 +183,37 @@ func (q *Queue) Close() error {
 	return firstErr
 }
 
-// IsSuperUser reports whether user is a queue super user.
+// IsSuperUser reports whether user, an authenticated user@domain, is a queue
+// super user. The whole name is compared: condor@<other domain> is not the
+// super user condor.
 func (q *Queue) IsSuperUser(user string) bool {
+	if user == "" {
+		return false
+	}
 	q.authzMu.RLock()
 	defer q.authzMu.RUnlock()
-	return q.supers[user] || q.supers[shortName(user)]
+	return q.supers[q.canonicalUser(user)]
+}
+
+// buildSupers resolves the QUEUE_SUPER_USERS entries to the set of identities
+// IsSuperUser admits, as the C++ schedd's InitQmgmt does (qmgmt.cpp
+// ~1481-1513): an entry without a domain names that user in UID_DOMAIN, and
+// "condor" also admits condor@child, condor@parent and condor@family, the
+// identities of the sessions condor_master shares with its children.
+func (q *Queue) buildSupers(entries []string) map[string]bool {
+	supers := map[string]bool{}
+	for _, s := range entries {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		supers[q.canonicalUser(s)] = true
+		if s == "condor" {
+			for _, fam := range []string{"condor@child", "condor@parent", "condor@family"} {
+				supers[q.canonicalUser(fam)] = true
+			}
+		}
+	}
+	return supers
 }
 
 // authzSnapshot returns the current QMGMT authorization config under the read
@@ -201,12 +232,7 @@ func (q *Queue) authzSnapshot() authzConfig {
 // stamped with at Begin; new transactions and every subsequent authorize() see the
 // new config. Safe to call from any goroutine.
 func (q *Queue) SetAuthz(opts Options) {
-	supers := map[string]bool{}
-	for _, s := range opts.SuperUsers {
-		if s = strings.TrimSpace(s); s != "" {
-			supers[s] = true
-		}
-	}
+	supers := q.buildSupers(opts.SuperUsers)
 	az := buildAuthzConfig(opts)
 	q.authzMu.Lock()
 	q.supers = supers
@@ -230,14 +256,18 @@ func (q *Queue) allocClusterID() (int, error) {
 	return id, nil
 }
 
-// Begin starts a new transaction owned by authUser. effectiveOwner is honored
-// only for super users; otherwise the owner is forced to authUser.
+// Begin starts a new transaction owned by authUser, the caller's authenticated
+// user@domain ("" for an anonymous caller). Jobs it creates get the user part
+// as their Owner and the full name as their User, as the C++ schedd records
+// the socket's owner and fully-qualified user. An identity in the "unmapped"
+// domain (an SSL or SciTokens peer no map file named) is not an account, so
+// such a transaction is anonymous: it may read but not write.
 func (q *Queue) Begin(authUser string) *Txn {
-	owner := shortName(authUser)
-	user := authUser
-	if !strings.Contains(user, "@") && q.domain != "" {
-		user = owner + "@" + q.domain
+	if isUnmapped(authUser) {
+		authUser = ""
 	}
+	user := q.qualify(authUser)
+	owner := shortName(user)
 	return &Txn{
 		q:         q,
 		authUser:  authUser,
@@ -351,12 +381,63 @@ func isStructural(key []byte) bool {
 	return p < 0 // cluster ad
 }
 
-// shortName strips a trailing @domain from a fully-qualified user.
+// shortName returns the user part of a fully-qualified user, the name before
+// its last '@' (split_canonical_name).
 func shortName(user string) string {
-	if i := strings.IndexByte(user, '@'); i >= 0 {
-		return user[:i]
+	name, _ := security.SplitFQU(user)
+	return name
+}
+
+// isUnmapped reports whether user is in the "unmapped" domain, which HTCondor
+// gives an SSL or SciTokens identity no map file renamed and an
+// unauthenticated peer (UNMAPPED_DOMAIN, authentication.cpp). Such a name is
+// not a local account.
+func isUnmapped(user string) bool {
+	_, domain := security.SplitFQU(user)
+	return strings.EqualFold(domain, security.UnmappedDomain)
+}
+
+// qualify returns user as user@domain, giving a name without a domain this
+// schedd's UID_DOMAIN, as is_same_user's ASSUME_UID_DOMAIN does
+// (src/condor_utils/uids.cpp). With no UID_DOMAIN a bare name stays bare.
+func (q *Queue) qualify(user string) string {
+	if user == "" || strings.Contains(user, "@") || q.domain == "" {
+		return user
 	}
-	return user
+	return user + "@" + q.domain
+}
+
+// canonicalUser is qualify with the domain lowercased, the form two names are
+// compared in: user parts compare exactly, domains ignoring case.
+func (q *Queue) canonicalUser(user string) string {
+	name, domain := security.SplitFQU(q.qualify(user))
+	if domain == "" {
+		return name
+	}
+	return name + "@" + strings.ToLower(domain)
+}
+
+// SameUser reports whether a and b name the same user: the same user part and
+// the same domain, a name without a domain standing for UID_DOMAIN. An empty
+// name matches nothing.
+func (q *Queue) SameUser(a, b string) bool {
+	if shortName(a) == "" || shortName(b) == "" {
+		return false
+	}
+	return q.canonicalUser(a) == q.canonicalUser(b)
+}
+
+// JobUser returns the identity that owns the job described by ad: its User
+// attribute, which the C++ schedd keys job ownership on, or for an ad without
+// one its Owner in UID_DOMAIN. "" if the ad names neither.
+func (q *Queue) JobUser(ad *classad.ClassAd) string {
+	if u, ok := ad.EvaluateAttrString("User"); ok && u != "" {
+		return u
+	}
+	if o, ok := ad.EvaluateAttrString("Owner"); ok && o != "" {
+		return q.qualify(o)
+	}
+	return ""
 }
 
 // globalJobID builds "<ScheddName>#<c>.<p>#<QDate>".

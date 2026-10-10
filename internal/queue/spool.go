@@ -8,12 +8,12 @@ import (
 // Spool-support helpers for the SPOOL_JOB_FILES / TRANSFER_DATA command handlers
 // (internal/spool). Kept in their own file so the spool feature touches the queue
 // package only through this additive surface (the core queue.go / actions.go /
-// txn.go remain owned elsewhere). These wrap the unexported owner short-naming
+// txn.go remain owned elsewhere). These wrap the unexported ownership check
 // and the history archive, which the out-of-package spool handler cannot reach.
 
 // OwnsJobAd reports whether authUser may spool for / retrieve the sandbox of the
-// job described by ad: either a queue super user, or the ad's short Owner name
-// matches the authenticated user's short name. Mirrors UserCheck2 in the C++
+// job described by ad: either a queue super user, or the job's User (see
+// JobUser) is authUser's whole user@domain. Mirrors UserCheck2 in the C++
 // schedd's spoolJobFiles path.
 func (q *Queue) OwnsJobAd(authUser string, ad *classad.ClassAd) bool {
 	if ad == nil {
@@ -22,8 +22,7 @@ func (q *Queue) OwnsJobAd(authUser string, ad *classad.ClassAd) bool {
 	if q.IsSuperUser(authUser) {
 		return true
 	}
-	owner, _ := ad.EvaluateAttrString("Owner")
-	return owner != "" && owner == shortName(authUser)
+	return q.SameUser(authUser, q.JobUser(ad))
 }
 
 // SpoolQuery returns the flattened proc ads matching the ClassAd constraint

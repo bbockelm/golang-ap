@@ -103,6 +103,27 @@ func run() error {
 		sec.RemoteVersion = detectCondorVersion()
 	}
 
+	// Command-socket listener: the shared-port endpoint inherited from
+	// condor_master if present, otherwise a plain TCP bind. Under USE_SHARED_PORT
+	// (required) the fallback is not used in practice. Resolved before the
+	// security config is finished, which needs the shared-port id.
+	ln, err := d.Listener(func() (net.Listener, error) {
+		return net.Listen("tcp", *listen)
+	})
+	if err != nil {
+		log.Error(logging.DestinationGeneral, "listener setup failed", "err", err.Error())
+		return err
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Peer identities are user@domain; a peer that authenticates without a
+	// domain of its own (FS, CLAIMTOBE) is in UID_DOMAIN. Behind shared port,
+	// FS channel binding checks a client-reported sock id against ours.
+	if uid, ok := cfg.Get("UID_DOMAIN"); ok {
+		sec.UIDDomain = strings.TrimSpace(uid)
+	}
+	sec.SharedPortID = d.SharedPortName()
+
 	// Share one session cache between the command server and the match table so
 	// startd keepalives (ALIVE) that resume a claim-derived session are recognized
 	// by the server and renew the right match's lease.
@@ -147,18 +168,6 @@ func run() error {
 		}
 		return nil
 	}, "WRITE")
-
-	// Command-socket listener: the shared-port endpoint inherited from
-	// condor_master if present, otherwise a plain TCP bind. Under USE_SHARED_PORT
-	// (required) the fallback is not used in practice.
-	ln, err := d.Listener(func() (net.Listener, error) {
-		return net.Listen("tcp", *listen)
-	})
-	if err != nil {
-		log.Error(logging.DestinationGeneral, "listener setup failed", "err", err.Error())
-		return err
-	}
-	defer func() { _ = ln.Close() }()
 
 	// Publish our command address so tools (condor_status, condor_q) and the
 	// collector can find us, exactly like the C++ schedd's SCHEDD_ADDRESS_FILE.

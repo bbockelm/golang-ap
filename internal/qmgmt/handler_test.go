@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	"github.com/bbockelm/cedar/stream"
@@ -234,4 +235,153 @@ func TestQmgmtAuthenticatedOwner(t *testing.T) {
 	if _, ok := q.Get(c, 0); ok {
 		t.Errorf("owner DestroyProc did not remove %d.0", c)
 	}
+}
+
+// jobUser returns job c.0's User, failing the test if the job is gone.
+func jobUser(t *testing.T, q *queue.Queue, c int) string {
+	t.Helper()
+	u, _ := mustGet(t, q, c).EvaluateAttrString("User")
+	return u
+}
+
+// Queue super users are compared as the whole user@domain: the bare
+// QUEUE_SUPER_USERS entry "condor" is condor@UID_DOMAIN plus the family,
+// parent and child session identities, not condor at any domain.
+func TestQmgmtSuperUserIsTheFullName(t *testing.T) {
+	q := openQueue(t)
+	c := seedJob(t, q, "alice")
+
+	for _, user := range []string{"condor@otherdomain", "condor@pool.otherdomain", "Condor@pool", "condor@unmapped"} {
+		t.Run("not super "+user, func(t *testing.T) {
+			cl := dial(t, q, conntest.Negotiation(user, true))
+			r, e := cl.call(hqmgmt.OpSetAttribute, c, 0, `"edited"`, "Cmd")
+			wantDenied(t, "SetAttribute on alice's job", r, e)
+			r, e = cl.call(hqmgmt.OpDestroyProc, c, 0)
+			wantDenied(t, "DestroyProc on alice's job", r, e)
+			r, e = cl.call(hqmgmt.OpSetEffectiveOwner, "bob")
+			wantDenied(t, "SetEffectiveOwner(bob)", r, e)
+			r, e = cl.call(hqmgmt.OpCommitTransactionNoFlags)
+			wantOK(t, "commit", r, e)
+			cl.close()
+			if !q.IsSuperUser("condor@pool") || q.IsSuperUser(user) {
+				t.Errorf("IsSuperUser: condor@pool=%v %s=%v, want true/false",
+					q.IsSuperUser("condor@pool"), user, q.IsSuperUser(user))
+			}
+		})
+	}
+	if ad, _ := q.Get(c, 0); ad != nil {
+		if cmd, _ := ad.EvaluateAttrString("Cmd"); cmd != "/bin/true" {
+			t.Fatalf("alice's job Cmd = %q after non-super edits, want /bin/true", cmd)
+		}
+	}
+
+	for _, user := range []string{"condor@pool", "condor@POOL", "condor@family", "condor@parent", "condor@child"} {
+		t.Run("super "+user, func(t *testing.T) {
+			cl := dial(t, q, conntest.Negotiation(user, true))
+			r, e := cl.call(hqmgmt.OpSetAttribute, c, 0, `"`+user+`"`, "EditedBy")
+			wantOK(t, "SetAttribute on alice's job", r, e)
+			r, e = cl.call(hqmgmt.OpSetEffectiveOwner, "bob")
+			wantOK(t, "SetEffectiveOwner(bob)", r, e)
+			r, e = cl.call(hqmgmt.OpCommitTransactionNoFlags)
+			wantOK(t, "commit", r, e)
+			cl.close()
+			ad, _ := q.Get(c, 0)
+			if got, _ := ad.EvaluateAttrString("EditedBy"); got != user {
+				t.Errorf("EditedBy = %q, want %q", got, user)
+			}
+		})
+	}
+}
+
+// A job is owned by its whole User: alice@pool owns the jobs she submits and
+// alice@otherpool, whose jobs carry the same Owner, owns none of them.
+func TestQmgmtOwnerIsTheFullName(t *testing.T) {
+	q := openQueue(t)
+	c := seedJob(t, q, "alice@pool")
+
+	other := dial(t, q, conntest.Negotiation("alice@otherpool", true))
+	r, e := other.call(hqmgmt.OpSetAttribute, c, 0, `"edited"`, "Cmd")
+	wantDenied(t, "alice@otherpool SetAttribute on alice@pool's job", r, e)
+	r, e = other.call(hqmgmt.OpDestroyProc, c, 0)
+	wantDenied(t, "alice@otherpool DestroyProc on alice@pool's job", r, e)
+	r, e = other.call(hqmgmt.OpDestroyCluster, c)
+	wantDenied(t, "alice@otherpool DestroyCluster on alice@pool's job", r, e)
+	// The bare name is alice in UID_DOMAIN (alice@pool), not a self-set.
+	r, e = other.call(hqmgmt.OpSetEffectiveOwner, "alice")
+	wantDenied(t, "alice@otherpool SetEffectiveOwner(alice)", r, e)
+	r, e = other.call(hqmgmt.OpSetEffectiveOwner, "alice@otherpool")
+	wantOK(t, "alice@otherpool SetEffectiveOwner(self)", r, e)
+	oc, e := other.call(hqmgmt.OpNewCluster)
+	wantOK(t, "alice@otherpool NewCluster", oc, e)
+	r, e = other.call(hqmgmt.OpNewProc, oc)
+	wantOK(t, "alice@otherpool NewProc", r, e)
+	r, e = other.call(hqmgmt.OpCommitTransactionNoFlags)
+	wantOK(t, "alice@otherpool commit", r, e)
+	other.close()
+
+	if cmd, _ := mustGet(t, q, c).EvaluateAttrString("Cmd"); cmd != "/bin/true" {
+		t.Errorf("alice@pool's job Cmd = %q, want unchanged /bin/true", cmd)
+	}
+	if got := jobUser(t, q, oc); got != "alice@otherpool" {
+		t.Errorf("alice@otherpool's job User = %q, want alice@otherpool", got)
+	}
+	if got, _ := mustGet(t, q, oc).EvaluateAttrString("Owner"); got != "alice" {
+		t.Errorf("alice@otherpool's job Owner = %q, want alice", got)
+	}
+
+	alice := dial(t, q, conntest.Negotiation("alice@pool", true))
+	r, e = alice.call(hqmgmt.OpSetAttribute, oc, 0, `"edited"`, "Cmd")
+	wantDenied(t, "alice@pool SetAttribute on alice@otherpool's job", r, e)
+	r, e = alice.call(hqmgmt.OpSetAttribute, c, 0, `"edited"`, "Cmd")
+	wantOK(t, "alice@pool SetAttribute on her own job", r, e)
+	r, e = alice.call(hqmgmt.OpSetEffectiveOwner, "alice")
+	wantOK(t, "alice@pool SetEffectiveOwner(alice)", r, e)
+	nc, e := alice.call(hqmgmt.OpNewCluster)
+	wantOK(t, "alice@pool NewCluster", nc, e)
+	r, e = alice.call(hqmgmt.OpNewProc, nc)
+	wantOK(t, "alice@pool NewProc", r, e)
+	r, e = alice.call(hqmgmt.OpCommitTransactionNoFlags)
+	wantOK(t, "alice@pool commit", r, e)
+	alice.close()
+	if cmd, _ := mustGet(t, q, c).EvaluateAttrString("Cmd"); cmd != "edited" {
+		t.Errorf("alice@pool's own edit: Cmd = %q, want edited", cmd)
+	}
+	if got := jobUser(t, q, nc); got != "alice@pool" {
+		t.Errorf("alice@pool's job User = %q, want alice@pool", got)
+	}
+}
+
+// A peer authenticated in the "unmapped" domain (SSL or SciTokens without a
+// map file) has no local account and cannot submit or edit.
+func TestQmgmtUnmappedCannotSubmit(t *testing.T) {
+	for _, user := range []string{"ssl@unmapped", "scitokens@unmapped", "alice@UNMAPPED"} {
+		t.Run(user, func(t *testing.T) {
+			q := openQueue(t)
+			c := seedJob(t, q, "alice")
+			before := q.Counts().Total
+
+			cl := dial(t, q, conntest.Negotiation(user, true))
+			r, e := cl.call(hqmgmt.OpNewCluster)
+			wantDenied(t, "NewCluster", r, e)
+			r, e = cl.call(hqmgmt.OpSetAttribute, c, 0, `"edited"`, "Cmd")
+			wantDenied(t, "SetAttribute", r, e)
+			r, e = cl.call(hqmgmt.OpSetEffectiveOwner, user)
+			wantDenied(t, "SetEffectiveOwner(self)", r, e)
+			r, e = cl.call(hqmgmt.OpCommitTransactionNoFlags)
+			wantOK(t, "empty commit", r, e)
+			cl.close()
+			if got := q.Counts().Total; got != before {
+				t.Errorf("queue has %d jobs, want %d", got, before)
+			}
+		})
+	}
+}
+
+func mustGet(t *testing.T, q *queue.Queue, c int) *classad.ClassAd {
+	t.Helper()
+	ad, ok := q.Get(c, 0)
+	if !ok {
+		t.Fatalf("job %d.0 missing", c)
+	}
+	return ad
 }
