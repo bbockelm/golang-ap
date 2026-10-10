@@ -68,7 +68,7 @@ func TestRootGatedSpoolOwnership(t *testing.T) {
 	if err := ps.MkdirAll(ctx, target, sandbox, 0o755); err != nil {
 		t.Fatalf("MkdirAll as %s: %v", target, err)
 	}
-	sink := &dirSink{root: sandbox, ps: ps, owner: privsepUser(target), ctx: ctx, logf: t.Logf}
+	sink := &dirSink{root: sandbox, ps: ps, owner: target, ctx: ctx, logf: t.Logf}
 	for _, name := range []string{"result.txt", "sub/deep.txt"} {
 		w, err := sink.File(name, 0o644, 0)
 		if err != nil {

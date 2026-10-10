@@ -54,7 +54,6 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
 	"github.com/bbockelm/golang-htcondor/droppriv"
@@ -112,38 +111,13 @@ func New(opts Options) *Handler {
 	return &Handler{q: opts.Queue, spoolDir: opts.SpoolDir, logf: logf, reschedule: opts.Reschedule, ps: ps}
 }
 
-// privsepUser maps a job ad's Owner to the droppriv user to run per-user file
-// ops as. droppriv rejects "root"/"condor" and treats "" as "run as the current
-// user, no privilege switch" (the personal-AP / unprivileged no-op), so any
-// owner that is not a normal username falls back to "".
-func privsepUser(owner string) string {
-	owner = strings.TrimSpace(owner)
-	if owner == "" || owner == "root" || owner == "condor" {
-		return ""
-	}
-	return owner
-}
-
-// jobAccount returns the privsep user to handle ad's sandbox as (see
-// privsepUser). It refuses a job whose User is in the "unmapped" domain (an
-// SSL or SciTokens identity no map file named): its Owner is not a local
-// account, so no account lookup, chown or privilege switch may be made for it.
-func jobAccount(ad *classad.ClassAd) (string, error) {
-	user, _ := ad.EvaluateAttrString("User")
-	if _, domain := security.SplitFQU(user); strings.EqualFold(domain, security.UnmappedDomain) {
-		return "", fmt.Errorf("job owner %q is not a local account", user)
-	}
-	owner, _ := ad.EvaluateAttrString("Owner")
-	return privsepUser(owner), nil
-}
-
-// ownerOf returns the privsep user for job c.p (see jobAccount).
+// ownerOf returns the privsep user for job c.p (see identity.JobAccount).
 func (h *Handler) ownerOf(c, p int) (string, error) {
 	ad, ok := h.q.Get(c, p)
 	if !ok {
 		return "", fmt.Errorf("spool: job %d.%d not found", c, p)
 	}
-	owner, err := jobAccount(ad)
+	owner, err := identity.JobAccount(ad)
 	if err != nil {
 		return "", fmt.Errorf("spool: job %d.%d: %w", c, p, err)
 	}
@@ -315,7 +289,7 @@ func (h *Handler) preSpoolCheck(authUser string, c, p int, now int64) error {
 	if !h.q.OwnsJobAd(authUser, ad) {
 		return fmt.Errorf("spool: user %q may not spool for job %d.%d", authUser, c, p)
 	}
-	if _, err := jobAccount(ad); err != nil {
+	if _, err := identity.JobAccount(ad); err != nil {
 		return fmt.Errorf("spool: job %d.%d: %w", c, p, err)
 	}
 	if fin, ok := ad.EvaluateAttrInt("StageInFinish"); ok && fin != 0 {
@@ -391,7 +365,7 @@ func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
 		if !h.q.OwnsJobAd(authUser, ad) {
 			continue
 		}
-		if _, err := jobAccount(ad); err != nil {
+		if _, err := identity.JobAccount(ad); err != nil {
 			cl, pr, _ := jobIDsOf(ad)
 			h.logf("spool: TRANSFER_DATA: skipping job %d.%d: %v", cl, pr, err)
 			continue
@@ -450,7 +424,7 @@ func (h *Handler) doTransfer(ctx context.Context, c *cedarserver.Conn) error {
 // the best-effort read consumes.
 func (h *Handler) sendSandbox(ctx context.Context, st *stream.Stream, ad *classad.ClassAd, c, p int) error {
 	dir := SandboxDir(h.spoolDir, c, p)
-	owner, err := jobAccount(ad)
+	owner, err := identity.JobAccount(ad)
 	if err != nil {
 		return err
 	}

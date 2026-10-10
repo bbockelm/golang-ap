@@ -10,6 +10,7 @@ import (
 	"github.com/bbockelm/cedar/security"
 
 	"github.com/bbockelm/golang-ap/internal/conntest"
+	"github.com/bbockelm/golang-ap/internal/identity"
 	"github.com/bbockelm/golang-ap/internal/queue"
 )
 
@@ -160,8 +161,8 @@ func TestSpoolRefusesUnmappedOwner(t *testing.T) {
 	if spoolFor(t, q, super, c) {
 		t.Errorf("SPOOL_JOB_FILES accepted a job owned by ssl@unmapped")
 	}
-	if _, err := jobAccount(mustAd(t, q, c)); err == nil {
-		t.Errorf("jobAccount accepted a job owned by ssl@unmapped")
+	if _, err := identity.JobAccount(mustAd(t, q, c)); err == nil {
+		t.Errorf("identity.JobAccount accepted a job owned by ssl@unmapped")
 	}
 }
 

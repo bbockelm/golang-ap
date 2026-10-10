@@ -3,6 +3,7 @@ package identity
 import (
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 )
@@ -39,5 +40,36 @@ func TestCaller(t *testing.T) {
 	}
 	if got := Caller(&cedarserver.Conn{}); got != "" {
 		t.Errorf("Caller(raw conn) = %q, want empty", got)
+	}
+}
+
+func TestJobAccount(t *testing.T) {
+	for _, tc := range []struct {
+		owner, user string
+		want        string
+		ok          bool
+	}{
+		{"alice", "alice@pool", "alice", true},
+		{"alice", "", "alice", true},
+		{"condor", "condor@pool", "", true},
+		{"", "", "", true},
+		{"ssl", "ssl@unmapped", "", false},
+		{"alice", "alice@Unmapped", "", false},
+		{"unauthenticated", "unauthenticated@unmapped", "", false},
+		{"Unauthenticated", "Unauthenticated@pool", "", false},
+		{"root", "root@pool", "", false},
+		{"LOCAL_SYSTEM", "LOCAL_SYSTEM@pool", "", false},
+	} {
+		ad := classad.New()
+		if tc.owner != "" {
+			_ = ad.Set("Owner", tc.owner)
+		}
+		if tc.user != "" {
+			_ = ad.Set("User", tc.user)
+		}
+		got, err := JobAccount(ad)
+		if (err == nil) != tc.ok || got != tc.want {
+			t.Errorf("JobAccount(Owner=%q User=%q) = %q, %v; want %q, ok=%v", tc.owner, tc.user, got, err, tc.want, tc.ok)
+		}
 	}
 }

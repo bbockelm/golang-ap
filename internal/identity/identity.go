@@ -15,8 +15,10 @@
 package identity
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 )
@@ -46,4 +48,33 @@ func Caller(c *cedarserver.Conn) string {
 		return ""
 	}
 	return user
+}
+
+// JobAccount returns the local account to perform the per-user file
+// operations of the job described by ad as (droppriv's user): the job's
+// Owner. Owner condor, or no Owner, is the schedd's own account, returned as
+// "" ("run as the current user, no switch"), since droppriv does not switch
+// to condor.
+//
+// It refuses a job that has no local account: one whose User is in the
+// "unmapped" domain (an SSL or SciTokens identity no map file named, or an
+// unauthenticated peer), whose Owner is HTCondor's placeholder for an
+// unauthenticated peer, or whose Owner is root or LOCAL_SYSTEM, which the
+// C++ schedd never accepts as a job's Owner (qmgmt.cpp SetAttribute). No
+// account lookup, chown or privilege switch may be made for such a job.
+func JobAccount(ad *classad.ClassAd) (string, error) {
+	user, _ := ad.EvaluateAttrString("User")
+	if _, domain := security.SplitFQU(user); strings.EqualFold(domain, security.UnmappedDomain) {
+		return "", fmt.Errorf("job owner %q is not a local account", user)
+	}
+	owner, _ := ad.EvaluateAttrString("Owner")
+	switch owner = strings.TrimSpace(owner); {
+	case strings.EqualFold(owner, unauthenticatedUser):
+		return "", fmt.Errorf("job owner %q is not a local account", owner)
+	case owner == "root" || owner == "LOCAL_SYSTEM":
+		return "", fmt.Errorf("job owner %q is not permitted", owner)
+	case owner == "condor":
+		return "", nil
+	}
+	return owner, nil
 }
