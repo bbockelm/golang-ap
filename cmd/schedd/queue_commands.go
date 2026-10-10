@@ -5,6 +5,11 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"os/user"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/bbockelm/cedar/commands"
@@ -40,7 +45,10 @@ func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.
 	spool := resolveSpoolDir(cfg)
 	uidDomain, _ := cfg.Get("UID_DOMAIN")
 	acctDomain, _ := cfg.Get("ACCOUNTING_DOMAIN")
-	opts := queueAuthzOptions(cfg)
+	opts, err := queueAuthzOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
 	opts.Dir = strings.TrimSpace(spool)
 	opts.ScheddName = name
 	opts.UIDDomain = strings.TrimSpace(uidDomain)
@@ -53,33 +61,64 @@ func openJobQueue(cfg *config.Config, name string, log *logging.Logger) (*queue.
 	return q, nil
 }
 
-// queueAuthzOptions reads the QMGMT-authorization knobs (QUEUE_SUPER_USERS, the
-// *_JOB_ATTRS lists, and the trust toggles) into a queue.Options. It is shared by
-// openJobQueue at startup and by the condor_reconfig callback (Queue.SetAuthz), so
-// both build the authorization set identically. The SYSTEM_* attribute defaults are
-// baked into the queue; these knobs add operator extras and the trust flags,
+// queueAuthzOptions reads the QMGMT-authorization knobs (QUEUE_SUPER_USERS,
+// QUEUE_SUPER_USER_MAY_IMPERSONATE, the *_JOB_ATTRS lists, and the trust
+// toggles) into a queue.Options. It is shared by openJobQueue at startup and
+// by the condor_reconfig callback (Queue.SetAuthz), so both build the
+// authorization set identically. The SYSTEM_* attribute defaults are baked
+// into the queue; these knobs add operator extras and the trust flags,
 // mirroring the C++ schedd's config.
-func queueAuthzOptions(cfg *config.Config) queue.Options {
-	supers := []string{"condor", "root"}
-	if v, ok := cfg.Get("QUEUE_SUPER_USERS"); ok {
-		for _, s := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
-			if s != "" {
-				supers = append(supers, s)
-			}
+//
+// The super users are as InitQmgmt (qmgmt.cpp) builds them: QUEUE_SUPER_USERS
+// replaces its default of root and condor (an empty value leaves root alone),
+// and the account the schedd runs as is added unless
+// PERSONAL_CONDOR_IS_SUPER_USER is false.
+func queueAuthzOptions(cfg *config.Config) (queue.Options, error) {
+	supers := []string{"root", "condor"}
+	if _, ok := cfg.Get("QUEUE_SUPER_USERS"); ok {
+		supers = attrList(cfg, "QUEUE_SUPER_USERS")
+		if len(supers) == 0 {
+			supers = []string{"root"}
 		}
+	}
+	if configBool(cfg, "PERSONAL_CONDOR_IS_SUPER_USER", true) {
+		if u := condorUsername(); u != "" {
+			supers = append(supers, u)
+		}
+	}
+	var mayImpersonate *regexp.Regexp
+	if v, ok := cfg.Get("QUEUE_SUPER_USER_MAY_IMPERSONATE"); ok && strings.TrimSpace(v) != "" {
+		re, err := regexp.Compile(strings.TrimSpace(v))
+		if err != nil {
+			return queue.Options{}, fmt.Errorf("QUEUE_SUPER_USER_MAY_IMPERSONATE is an invalid regular expression: %w", err)
+		}
+		mayImpersonate = re
 	}
 	return queue.Options{
 		SuperUsers:        supers,
+		MayImpersonate:    mayImpersonate,
 		ImmutableAttrs:    attrList(cfg, "IMMUTABLE_JOB_ATTRS"),
 		ProtectedAttrs:    attrList(cfg, "PROTECTED_JOB_ATTRS"),
 		SecureAttrs:       attrList(cfg, "SECURE_JOB_ATTRS"),
 		AllUsersTrusted:   configBool(cfg, "QUEUE_ALL_USERS_TRUSTED", false),
 		IgnoreSecureAttrs: configBool(cfg, "IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS", true),
-	}
+	}, nil
 }
 
-// attrList splits a comma/space/tab-separated HTCondor attribute-list config
-// value (e.g. IMMUTABLE_JOB_ATTRS) into individual attribute names.
+// condorUsername returns the name of the account the schedd runs as, its
+// effective uid's (get_condor_username, uids.cpp): the condor user once a
+// daemon started as root has dropped privileges, the invoking user's for a
+// personal condor. "" if it cannot be looked up.
+var condorUsername = func() string {
+	u, err := user.LookupId(strconv.Itoa(os.Geteuid()))
+	if err != nil {
+		return ""
+	}
+	return u.Username
+}
+
+// attrList splits a comma/space/tab-separated HTCondor list config value
+// (e.g. IMMUTABLE_JOB_ATTRS) into its entries.
 func attrList(cfg *config.Config, key string) []string {
 	v, ok := cfg.Get(key)
 	if !ok {

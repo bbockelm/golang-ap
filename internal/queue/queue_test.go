@@ -158,10 +158,11 @@ func TestAtomicMultiProcCommit(t *testing.T) {
 }
 
 // TestOwnerEnforcement: a non-superuser cannot claim another owner; superusers
-// can.
+// can claim a user the schedd knows.
 func TestOwnerEnforcement(t *testing.T) {
 	q := openTestQueue(t, t.TempDir())
 	defer func() { _ = q.Close() }()
+	submitCluster(t, q, "bob", 1)
 
 	txn := q.Begin("alice")
 	if err := txn.SetEffectiveOwner("bob"); err == nil {

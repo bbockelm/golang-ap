@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"regexp"
 	"slices"
 	"testing"
 )
@@ -191,6 +192,7 @@ func TestFQUEffectiveOwner(t *testing.T) {
 		t.Errorf("self-set alice: Owner=%q User=%q, want alice alice@example.net", o, u)
 	}
 
+	submitJobs(t, q, "bob@example.net", 1, nil, nil)
 	txn = q.Begin("condor@family")
 	if err := txn.SetEffectiveOwner("bob"); err != nil {
 		t.Fatalf("superuser SetEffectiveOwner(bob): %v", err)
@@ -239,5 +241,74 @@ func TestFQUSubmitterName(t *testing.T) {
 	submitJobs(t, q2, "carol@otherpool", 1, nil, nil)
 	if scs := q2.SubmitterCounts(); len(scs) != 1 || scs[0].Name != "carol@example.net" {
 		t.Errorf("SubmitterCounts = %+v, want carol@example.net", scs)
+	}
+}
+
+// A super user may submit as a user the schedd knows -- one with a job in the
+// queue or the history -- and as no other, unless
+// QUEUE_SUPER_USER_MAY_IMPERSONATE is set, when the user name must match it
+// instead (SuperUserAllowedToSetOwnerTo, qmgmt.cpp). No one submits as root
+// or LOCAL_SYSTEM.
+func TestSuperUserImpersonation(t *testing.T) {
+	q := openAuthzQueue(t, Options{})
+	defer func() { _ = q.Close() }()
+	impersonate := func(owner string) error {
+		return q.Begin("condor@family").SetEffectiveOwner(owner)
+	}
+
+	for _, owner := range []string{"carol", "carol@example.net", "dave"} {
+		if err := impersonate(owner); err == nil {
+			t.Errorf("SetEffectiveOwner(%s) with no jobs succeeded, want refused", owner)
+		}
+	}
+	submitJobs(t, q, "carol@example.net", 1, nil, nil)
+	done := submitJobs(t, q, "dave@example.net", 1, nil, nil)
+	q.Complete(done, 0)
+	if _, ok := q.Get(done, 0); ok {
+		t.Fatalf("job %d.0 still in the queue after Complete", done)
+	}
+	for _, owner := range []string{"carol", "carol@example.net", "carol@EXAMPLE.NET", "dave"} {
+		if err := impersonate(owner); err != nil {
+			t.Errorf("SetEffectiveOwner(%s): %v", owner, err)
+		}
+	}
+	for _, owner := range []string{"Carol", "carol@otherpool", "erin", "root", "LOCAL_SYSTEM"} {
+		if err := impersonate(owner); err == nil {
+			t.Errorf("SetEffectiveOwner(%s) succeeded, want refused", owner)
+		}
+	}
+	if err := q.Begin("carol@example.net").SetEffectiveOwner("dave"); err == nil {
+		t.Error("non-super user SetEffectiveOwner(dave) succeeded, want refused")
+	}
+
+	q.SetAuthz(Options{SuperUsers: []string{"condor"}, MayImpersonate: regexp.MustCompile(`^svc_|^root$|^LOCAL_SYSTEM$`)})
+	for _, owner := range []string{"svc_erin", "svc_erin@example.net"} {
+		if err := impersonate(owner); err != nil {
+			t.Errorf("SetEffectiveOwner(%s) under QUEUE_SUPER_USER_MAY_IMPERSONATE: %v", owner, err)
+		}
+	}
+	for _, owner := range []string{"carol", "erin", "root", "LOCAL_SYSTEM"} {
+		if err := impersonate(owner); err == nil {
+			t.Errorf("SetEffectiveOwner(%s) under QUEUE_SUPER_USER_MAY_IMPERSONATE succeeded, want refused", owner)
+		}
+	}
+
+	txn := q.Begin("condor@family")
+	if err := txn.SetEffectiveOwner("svc_erin"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := txn.NewCluster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.NewProc(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	ad, _ := q.Get(c, 0)
+	if u, _ := ad.EvaluateAttrString("User"); u != "svc_erin@example.net" {
+		t.Errorf("impersonated job User = %q, want svc_erin@example.net", u)
 	}
 }

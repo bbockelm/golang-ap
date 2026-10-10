@@ -117,11 +117,14 @@ Everything the schedd owns lives under `$(SPOOL)`:
 ## Configuration
 
 Standard knobs (`SPOOL`, `COLLECTOR_HOST`, `SCHEDD_NAME`, `UID_DOMAIN`,
-`MAX_JOBS_RUNNING`, `QUEUE_SUPER_USERS`, `IMMUTABLE_JOB_ATTRS` /
+`MAX_JOBS_RUNNING`, `QUEUE_SUPER_USERS`, `QUEUE_SUPER_USER_MAY_IMPERSONATE`,
+`PERSONAL_CONDOR_IS_SUPER_USER`, `IMMUTABLE_JOB_ATTRS` /
 `PROTECTED_JOB_ATTRS` / `SECURE_JOB_ATTRS`, `QUEUE_ALL_USERS_TRUSTED`,
 `SYSTEM_PERIODIC_HOLD` / `_RELEASE` / `_REMOVE`, `ALIVE_INTERVAL`,
 `JOB_DEFAULT_LEASE_DURATION`, `MAX_SHADOW_EXCEPTIONS`, the `SEC_*` family) are
-honored with their usual meaning.
+honored with their usual meaning. The schedd keeps no user records, so a
+queue super user without `QUEUE_SUPER_USER_MAY_IMPERSONATE` may submit as a
+user only while that user has a job in the queue or the history.
 
 Daemon-specific knobs:
 

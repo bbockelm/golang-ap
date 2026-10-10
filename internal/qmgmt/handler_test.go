@@ -250,6 +250,7 @@ func jobUser(t *testing.T, q *queue.Queue, c int) string {
 func TestQmgmtSuperUserIsTheFullName(t *testing.T) {
 	q := openQueue(t)
 	c := seedJob(t, q, "alice")
+	seedJob(t, q, "bob")
 
 	for _, user := range []string{"condor@otherdomain", "condor@pool.otherdomain", "Condor@pool", "condor@unmapped"} {
 		t.Run("not super "+user, func(t *testing.T) {
@@ -374,6 +375,45 @@ func TestQmgmtUnmappedCannotSubmit(t *testing.T) {
 				t.Errorf("queue has %d jobs, want %d", got, before)
 			}
 		})
+	}
+}
+
+// A queue super user may submit as a user the schedd knows and as no other:
+// SetEffectiveOwner to a user with no jobs, or to root, is refused, and the
+// jobs the connection then submits are its own.
+func TestQmgmtSuperUserImpersonatesKnownUsersOnly(t *testing.T) {
+	q := openQueue(t)
+	seedJob(t, q, "bob")
+	submit := func(owner string) (int, int) {
+		cl := dial(t, q, conntest.Negotiation("condor@pool", true))
+		r, e := cl.call(hqmgmt.OpSetEffectiveOwner, owner)
+		c, e2 := cl.call(hqmgmt.OpNewCluster)
+		wantOK(t, "NewCluster", c, e2)
+		p, e2 := cl.call(hqmgmt.OpNewProc, c)
+		wantOK(t, "NewProc", p, e2)
+		p, e2 = cl.call(hqmgmt.OpCommitTransactionNoFlags)
+		wantOK(t, "commit", p, e2)
+		cl.close()
+		if r >= 0 {
+			return c, 0
+		}
+		return c, e
+	}
+	for _, owner := range []string{"carol", "root"} {
+		c, terrno := submit(owner)
+		if terrno != eACCES {
+			t.Errorf("SetEffectiveOwner(%s): terrno %d, want EACCES", owner, terrno)
+		}
+		if got := jobUser(t, q, c); got != "condor@pool" {
+			t.Errorf("job submitted after SetEffectiveOwner(%s) was refused has User %q, want condor@pool", owner, got)
+		}
+	}
+	c, terrno := submit("bob")
+	if terrno != 0 {
+		t.Errorf("SetEffectiveOwner(bob): terrno %d, want success", terrno)
+	}
+	if got := jobUser(t, q, c); got != "bob@pool" {
+		t.Errorf("job submitted as bob has User %q, want bob@pool", got)
 	}
 }
 

@@ -414,7 +414,8 @@ func run() error {
 //   - PERIODIC_EXPR_INTERVAL     -> periodic-policy evaluator cadence
 //   - SCHEDD_MATERIALIZE_INTERVAL-> late-materialization engine cadence
 //   - SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON/_SUBCODE) -> recompiled policy
-//   - QUEUE_SUPER_USERS, IMMUTABLE/PROTECTED/SECURE_JOB_ATTRS,
+//   - QUEUE_SUPER_USERS, QUEUE_SUPER_USER_MAY_IMPERSONATE,
+//     PERSONAL_CONDOR_IS_SUPER_USER, IMMUTABLE/PROTECTED/SECURE_JOB_ATTRS,
 //     QUEUE_ALL_USERS_TRUSTED, IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS -> queue authz
 //
 // The ALLOW_<level>/DENY_<level> command authorization policy is rebuilt by
@@ -431,7 +432,11 @@ func reconfigure(cfg *config.Config, log *logging.Logger, scheduler *sched.Sched
 	scheduler.SetPeriodicInterval(configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval))
 	scheduler.SetSysPolicy(buildSysPolicy(cfg))
 	matEngine.SetInterval(configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
-	jobQueue.SetAuthz(queueAuthzOptions(cfg))
+	if opts, err := queueAuthzOptions(cfg); err != nil {
+		log.Error(logging.DestinationSecurity, "reloading queue authorization failed; keeping the previous one", "err", err.Error())
+	} else {
+		jobQueue.SetAuthz(opts)
+	}
 	log.Info(logging.DestinationGeneral, "reconfig applied: schedd knobs re-read",
 		"schedd_interval", configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second).String(),
 		"periodic_expr_interval", configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval).String(),

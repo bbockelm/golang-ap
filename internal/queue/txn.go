@@ -46,8 +46,10 @@ func (t *Txn) ActiveCluster() int { return t.active }
 // matching QmgmtSetEffectiveOwner (qmgmt.cpp ~3400-3500). Naming the
 // authenticated user itself, with or without the domain, keeps the real
 // identity, domain included (is_same_user(o, real_owner) clears o there).
-// Any other owner is honored only for super users; a name without a domain is
-// taken to be in UID_DOMAIN.
+// Any other owner is honored only for super users, and only for an owner
+// they may impersonate (see Queue.mayImpersonate); a name without a domain is
+// taken to be in UID_DOMAIN. No one may submit as root or LOCAL_SYSTEM, which
+// the C++ schedd refuses as a job's Owner.
 func (t *Txn) SetEffectiveOwner(owner string) error {
 	if owner == "" {
 		return nil
@@ -62,6 +64,12 @@ func (t *Txn) SetEffectiveOwner(owner string) error {
 	}
 	if shortName(owner) == "" || isUnmapped(owner) {
 		return fmt.Errorf("effective owner %q is not a user", owner)
+	}
+	if name := shortName(owner); name == "root" || name == "LOCAL_SYSTEM" {
+		return fmt.Errorf("effective owner %q is not permitted", owner)
+	}
+	if !t.q.mayImpersonate(owner) {
+		return fmt.Errorf("user %q may not impersonate %q", t.authUser, owner)
 	}
 	t.user = t.q.qualify(owner)
 	t.owner = shortName(t.user)
