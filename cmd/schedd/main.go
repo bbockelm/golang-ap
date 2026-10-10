@@ -110,6 +110,16 @@ func run() error {
 	sec.SessionCache = sessionCache
 
 	srv := cedarserver.New(sec)
+	// ALLOW_<level>/DENY_<level> authorization for every command on the
+	// socket, each negotiated at its own level's SEC_<level>_* policy, as the
+	// C++ schedd's DaemonCore does. The policy is rebuilt on reconfig.
+	az, err := newScheddAuthz(d.Config())
+	if err != nil {
+		return fmt.Errorf("building authorization policy: %w", err)
+	}
+	if err := installAuthz(srv, az, d.Config(), sec); err != nil {
+		return fmt.Errorf("building per-level security config: %w", err)
+	}
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon, and
 	// condor_off -daemon work against our command port.
 	d.RegisterDefaultCommands(srv)
@@ -319,11 +329,11 @@ func run() error {
 		UserlogDropped:   ulogMgr.Dropped,
 	})
 
-	// NEGOTIATE (416): the negotiator's matchmaking. Registered at NEGOTIATOR (and
-	// WRITE) like the C++ schedd; granted matches feed the scheduler core.
+	// NEGOTIATE (416): the negotiator's matchmaking, at NEGOTIATOR like the C++
+	// schedd; granted matches feed the scheduler core.
 	neg := negotiate.New(jobQueue, log, scheduler.OnMatch)
 	neg.SetStats(statsColl)
-	srv.Handle(int(commands.NEGOTIATE), neg.Handle, "NEGOTIATOR", "WRITE")
+	neg.Register(srv)
 
 	// Sandbox spooling (condor_submit -spool / condor_transfer_data):
 	// SPOOL_JOB_FILES(480) / SPOOL_JOB_FILES_WITH_PERMS(488) receive input
@@ -370,7 +380,7 @@ func run() error {
 	// components (see reconfigure). Registered before Start so a reconfig that
 	// races startup still lands on live components.
 	d.OnReconfig(func(newCfg *config.Config) {
-		reconfigure(newCfg, log, scheduler, matEngine, jobQueue)
+		reconfigure(newCfg, log, scheduler, matEngine, jobQueue, az)
 	})
 
 	scheduler.Start(ctx)
@@ -390,7 +400,7 @@ func run() error {
 	log.Info(logging.DestinationGeneral, "golang-ap schedd starting",
 		"listen", ln.Addr().String(), "under_master", d.UnderMaster(), "name", scheddName(cfg, *localName))
 
-	return d.Serve(ctx, ln, srv.Serve)
+	return d.Serve(ctx, ln, serveCommands(srv, az, d.Slog()))
 }
 
 // reconfigure re-reads the reconfigurable SCHEDD_* knobs (from the freshly
@@ -406,6 +416,7 @@ func run() error {
 //   - SYSTEM_PERIODIC_HOLD/RELEASE/REMOVE (+ _REASON/_SUBCODE) -> recompiled policy
 //   - QUEUE_SUPER_USERS, IMMUTABLE/PROTECTED/SECURE_JOB_ATTRS,
 //     QUEUE_ALL_USERS_TRUSTED, IGNORE_ATTEMPTS_TO_SET_SECURE_JOB_ATTRS -> queue authz
+//   - ALLOW_<level>/DENY_<level>  -> command authorization policy
 //
 // Still startup-only (documented, not reconfigured here): the listener / shared-port
 // endpoint and command address, SCHEDD_NAME, UID_DOMAIN, the security policy
@@ -413,12 +424,15 @@ func run() error {
 // worker-pool sizing (SCHEDD_USERLOG_*), the privsep mode, SCHEDD_RECONNECT, and the
 // spool/queue location.
 func reconfigure(cfg *config.Config, log *logging.Logger, scheduler *sched.Scheduler,
-	matEngine *factory.Engine, jobQueue *queue.Queue) {
+	matEngine *factory.Engine, jobQueue *queue.Queue, az *scheddAuthz) {
 	scheduler.SetAdvertiseInterval(configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second))
 	scheduler.SetPeriodicInterval(configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval))
 	scheduler.SetSysPolicy(buildSysPolicy(cfg))
 	matEngine.SetInterval(configSeconds(cfg, "SCHEDD_MATERIALIZE_INTERVAL", factory.DefaultInterval))
 	jobQueue.SetAuthz(queueAuthzOptions(cfg))
+	if err := az.reload(cfg); err != nil {
+		log.Error(logging.DestinationSecurity, "reloading authorization policy failed; keeping the previous one", "err", err.Error())
+	}
 	log.Info(logging.DestinationGeneral, "reconfig applied: schedd knobs re-read",
 		"schedd_interval", configSeconds(cfg, "SCHEDD_INTERVAL", 300*time.Second).String(),
 		"periodic_expr_interval", configSeconds(cfg, "PERIODIC_EXPR_INTERVAL", sched.DefaultPeriodicInterval).String(),

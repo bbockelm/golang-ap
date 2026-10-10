@@ -101,6 +101,12 @@ func New(q *queue.Queue, log *logging.Logger, onMatch func(Match)) *Handler {
 // is counted (NegotiationCycles). nil-safe.
 func (h *Handler) SetStats(s *stats.Collector) { h.stats = s }
 
+// Register installs Handle for NEGOTIATE on srv at NEGOTIATOR, the only level
+// the C++ schedd accepts it at (Scheduler::Register, schedd.cpp).
+func (h *Handler) Register(srv *cedarserver.Server) {
+	srv.Handle(commands.NEGOTIATE, h.Handle, "NEGOTIATOR")
+}
+
 // groupState tracks one offered resource-request group for the duration of a
 // round: its jobs in priority order, how many have been assigned to matches, and
 // whether the negotiator rejected the whole group.
