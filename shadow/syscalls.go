@@ -321,9 +321,10 @@ func (s *Shadow) serveOne(ctx context.Context) (done bool, err error) {
 		// args: string starter_reconnect_session_info, string
 		// starter_filetrans_session_info. reply: rval; on rval<0 terrno; on
 		// success 6 strings (reconnect id/info/key, filetrans id/info/key).
-		// Stage 3 does not mint transfer/reconnect sessions, so reply -1;
+		// Like RemoteResource::getSecSessionInfo, decline only when the
+		// claim id carries no security session;
 		// JICShadow::initMatchSecuritySession logs and carries on without
-		// them. Stage 4 replaces this with real session material.
+		// them.
 		if _, err := in.GetString(ctx); err != nil {
 			return false, fmt.Errorf("shadow: get_sec_session_info arg 1: %w", err)
 		}
@@ -333,15 +334,15 @@ func (s *Shadow) serveOne(ctx context.Context) (done bool, err error) {
 		if err := drain(ctx, in); err != nil {
 			return false, err
 		}
-		if s.transfer == nil {
-			s.logf("shadow: get_sec_session_info: declining (file transfer not configured)")
+		if s.sessions == nil {
+			s.logf("shadow: get_sec_session_info: declining (claim id has no security session)")
 			return false, s.replyInt(ctx, -1, errnoNoSys)
 		}
 		// Reply the 6 strings the starter's initMatchSecuritySession consumes:
 		// reconnect {id, info, key}, filetrans {id, info, key}, in one message,
 		// with rval=0 and no terrno (NTreceivers.cpp CONDOR_get_sec_session_info).
-		rc := s.transfer.reconnectSession
-		ft := s.transfer.filetransSession
+		rc := s.sessions.reconnect
+		ft := s.sessions.filetrans
 		s.logf("shadow: get_sec_session_info: handing starter reconnect+filetrans sessions (filetrans id %s)", ft.id)
 		out := message.NewMessageForStream(s.st)
 		if err := out.PutInt(ctx, 0); err != nil {

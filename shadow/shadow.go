@@ -161,9 +161,10 @@ type Config struct {
 	// KeepClaim suppresses the RELEASE_CLAIM after deactivation, for callers
 	// that will reuse the claim for another job.
 	KeepClaim bool
-	// ClaimID is the raw startd claim id backing this activation. It is required
-	// when TransferEndpoint is set: the reconnect and filetrans security
-	// sessions get_sec_session_info hands the starter are derived from it.
+	// ClaimID is the raw startd claim id backing this activation. The reconnect
+	// and filetrans security sessions get_sec_session_info hands the starter
+	// are derived from it, with or without file transfer; it is required when
+	// TransferEndpoint is set.
 	ClaimID string
 	// GlobalJobID is the job's GlobalJobId, sent to the startd in a
 	// CA_LOCATE_STARTER request during reconnect so it can find the claim.
@@ -183,8 +184,7 @@ type Config struct {
 	// TransferEndpoint, when set, enables stage-4 file transfer: the shadow acts
 	// as the file-transfer server for the starter. It generates a TransferKey,
 	// registers an input plan / output sink with the endpoint (routed by key),
-	// injects TransferKey/TransferSocket into the get_job_info ad, and answers
-	// get_sec_session_info with real reconnect + filetrans session material.
+	// and injects TransferKey/TransferSocket into the get_job_info ad.
 	// The endpoint (a cedar server hosting FILETRANS_UPLOAD/DOWNLOAD) is owned
 	// by the caller; several shadows may share one.
 	TransferEndpoint *Endpoint
@@ -227,6 +227,9 @@ type Shadow struct {
 	// transfer holds the stage-4 file-transfer state (nil when transfer is not
 	// configured). It is set up in New and torn down after Run.
 	transfer *transferState
+	// sessions is the claim-derived session material get_sec_session_info
+	// hands the starter; nil when the claim id carries no security session.
+	sessions *claimSessions
 
 	mu        sync.Mutex
 	starterAd *classad.ClassAd
@@ -252,6 +255,9 @@ func New(st *stream.Stream, closer io.Closer, cfg Config) (*Shadow, error) {
 		closer:   closer,
 		cfg:      cfg,
 		jobAttrs: make(map[string]string),
+	}
+	if err := s.setupClaimSessions(); err != nil {
+		return nil, err
 	}
 	if cfg.TransferEndpoint != nil {
 		ts, err := s.setupTransfer()
