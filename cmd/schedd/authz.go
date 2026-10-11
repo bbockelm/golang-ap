@@ -64,23 +64,16 @@ func installAuthz(d *daemon.Daemon, srv *cedarserver.Server, az *daemon.Authz) e
 
 // forceAuthentication wraps srv's per-command policy so forceAuthCommands
 // are negotiated with authentication required, as DaemonCore negotiates a
-// command registered with force_authentication, and so every policy
-// advertises srv.SecurityConfig's RemoteVersion, which the per-level
-// policies do not carry and C++ clients gate wire features on.
+// command registered with force_authentication.
 func forceAuthentication(srv *cedarserver.Server) {
 	levelConfig := srv.SecurityConfigForCommand
 	srv.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
 		cfg := levelConfig(command)
-		if cfg == nil {
-			return nil
+		if cfg == nil || !forceAuthCommands[command] {
+			return cfg
 		}
 		c := *cfg
-		if c.RemoteVersion == "" {
-			c.RemoteVersion = srv.SecurityConfig.RemoteVersion
-		}
-		if forceAuthCommands[command] {
-			c.Authentication = security.SecurityRequired
-		}
+		c.Authentication = security.SecurityRequired
 		return &c
 	}
 }

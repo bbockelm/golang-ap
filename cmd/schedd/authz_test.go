@@ -60,6 +60,7 @@ type authzSchedd struct {
 	stats     *stats.Collector
 	records   chan slog.Record
 	reconfigs atomic.Int32
+	version   string // the CondorVersion the schedd advertises
 }
 
 // startAuthzSchedd serves the schedd's commands with the ALLOW_/DENY_
@@ -97,6 +98,8 @@ func startAuthzSchedd(t *testing.T, knobs map[string]string) *authzSchedd {
 	if err != nil {
 		t.Fatal(err)
 	}
+	as.version = detectCondorVersion()
+	sec.RemoteVersion = as.version
 	as.cache = security.NewSessionCache()
 	sec.SessionCache = as.cache
 	srv := cedarserver.New(sec)
@@ -731,8 +734,9 @@ func TestCommandLevelsMatchCxx(t *testing.T) {
 // SEC_DAEMON_* while its own is unset and following SEC_ADVERTISE_<x>_* once
 // a reconfig sets it, a CONFIG command under SEC_DEFAULT_* rather than
 // SEC_DAEMON_*, and a forceAuthCommands command requires authentication
-// whatever its level's policy says. Every ALLOW_<level> admits anyone, so a
-// refused handshake is the security policy's doing, not authorization's.
+// whatever its level's policy says. Every handshake advertises the schedd's
+// detected CondorVersion. Every ALLOW_<level> admits anyone, so a refused
+// handshake is the security policy's doing, not authorization's.
 func TestCommandsNegotiateAtTheirLevel(t *testing.T) {
 	knobs := map[string]string{"SEC_DAEMON_AUTHENTICATION": "REQUIRED"}
 	for _, lvl := range []string{"READ", "WRITE", "NEGOTIATOR", "ADMINISTRATOR", "CONFIG", "DAEMON",
@@ -751,8 +755,13 @@ func TestCommandsNegotiateAtTheirLevel(t *testing.T) {
 		} else if accepted := err == nil; accepted != wantAnonymous {
 			t.Errorf("%s: anonymous %s negotiated = %v (err %v), want %v", phase, name, accepted, err, wantAnonymous)
 		}
-		if _, _, err := as.dial(t, as.token(t, "alice@pool"), cmd); err != nil {
+		cl, _, err := as.dial(t, as.token(t, "alice@pool"), cmd)
+		if err != nil {
 			t.Errorf("%s: authenticated %s refused: %v", phase, name, err)
+			return
+		}
+		if v := cl.GetSecurityNegotiation().ServerConfig.RemoteVersion; v != as.version {
+			t.Errorf("%s: %s negotiated with the schedd advertising version %q, want %q", phase, name, v, as.version)
 		}
 	}
 
