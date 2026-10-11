@@ -48,48 +48,39 @@ var forceAuthCommands = map[int]bool{
 	commands.QMGMT_WRITE_CMD:            true,
 }
 
-// securityLevels are the authorization levels schedd commands are registered
-// at, each negotiated with its own SEC_<level>_* policy.
-var securityLevels = []string{"ALLOW", "READ", "WRITE", "NEGOTIATOR", "ADMINISTRATOR", "DAEMON"}
-
 // installAuthz makes srv enforce az on every command it dispatches and
-// negotiate each command's security with the SEC_<level>_* policy of the
-// level it is registered at, as DaemonCore does, with authentication
-// required for forceAuthCommands. base is srv's SecurityConfig; each
-// level's policy is a copy of it (sharing its session cache, post-auth
-// policy and credentials) with that level's authentication, encryption,
-// integrity and methods, as levelConfig (Daemon.ServerSecurityConfig)
-// builds them. Call it after cedarserver.New.
-func installAuthz(srv *cedarserver.Server, az *daemon.Authz, base *security.SecurityConfig,
-	levelConfig func(command int, secContext string) (*security.SecurityConfig, error)) error {
+// negotiate each command under the SEC_<level>_* policy of the level it is
+// registered at, as DaemonCore does (Daemon.InstallSecurityLevels, rebuilt on
+// reconfig), with authentication required for forceAuthCommands. Call it
+// after d.Listener and cedarserver.New.
+func installAuthz(d *daemon.Daemon, srv *cedarserver.Server, az *daemon.Authz) error {
 	srv.Authorizer = az.Authorize
-	byLevel := map[string]*security.SecurityConfig{}
-	forced := map[string]*security.SecurityConfig{}
-	for _, lvl := range securityLevels {
-		s, err := levelConfig(commands.QUERY_SCHEDD_ADS, lvl)
-		if err != nil {
-			return err
-		}
-		c := *base
-		c.Authentication = s.Authentication
-		c.Encryption = s.Encryption
-		c.Integrity = s.Integrity
-		c.AuthMethods = s.AuthMethods
-		c.CryptoMethods = s.CryptoMethods
-		byLevel[lvl] = &c
-		f := c
-		f.Authentication = security.SecurityRequired
-		forced[lvl] = &f
+	if err := d.InstallSecurityLevels(srv); err != nil {
+		return err
 	}
+	forceAuthentication(srv)
+	return nil
+}
+
+// forceAuthentication wraps srv's per-command policy so forceAuthCommands
+// are negotiated with authentication required, as DaemonCore negotiates a
+// command registered with force_authentication, and so every policy
+// advertises srv.SecurityConfig's RemoteVersion, which the per-level
+// policies do not carry and C++ clients gate wire features on.
+func forceAuthentication(srv *cedarserver.Server) {
+	levelConfig := srv.SecurityConfigForCommand
 	srv.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
-		perms := srv.CommandPerms(command)
-		if len(perms) == 0 {
+		cfg := levelConfig(command)
+		if cfg == nil {
 			return nil
 		}
-		if forceAuthCommands[command] {
-			return forced[perms[0]]
+		c := *cfg
+		if c.RemoteVersion == "" {
+			c.RemoteVersion = srv.SecurityConfig.RemoteVersion
 		}
-		return byLevel[perms[0]]
+		if forceAuthCommands[command] {
+			c.Authentication = security.SecurityRequired
+		}
+		return &c
 	}
-	return nil
 }
