@@ -19,7 +19,6 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -105,7 +104,7 @@ func startAuthzSchedd(t *testing.T, knobs map[string]string) *authzSchedd {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := installAuthz(srv, as.az, sec, d.ServerSecurityConfig); err != nil {
+	if err := installAuthz(d, srv, as.az); err != nil {
 		t.Fatal(err)
 	}
 	d.RegisterDefaultCommands(srv)
@@ -657,23 +656,27 @@ func TestAuthzNegotiatorMatchSession(t *testing.T) {
 // TestCommandLevelsMatchCxx pins the level every schedd command is
 // registered at, and whether it is negotiated with authentication forced, to
 // the C++ schedd's registration (Scheduler::Register, schedd.cpp; FileTransfer
-// for FILETRANS_*; DaemonCore for DC_*).
+// for FILETRANS_*; DaemonCore for DC_*), and checks every command's policy
+// advertises the schedd's version.
 func TestCommandLevelsMatchCxx(t *testing.T) {
 	as := startAuthzSchedd(t, nil) // for its queue and logger
 	cfg := config.NewEmpty()
 	cfg.Set("SEC_DEFAULT_AUTHENTICATION", "OPTIONAL")
-	sec := &security.SecurityConfig{SessionCache: security.NewSessionCache()}
+	d, err := daemon.New(daemon.Options{Subsys: "SCHEDD", Config: cfg, Logger: as.log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const version = "$CondorVersion: 25.8.0 2026-03-11 $"
+	sec := &security.SecurityConfig{SessionCache: security.NewSessionCache(), RemoteVersion: version}
 	srv := cedarserver.New(sec)
 	az, err := daemon.NewAuthz(cfg, authzOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	levelConfig := func(command int, secContext string) (*security.SecurityConfig, error) {
-		return htcondor.GetServerSecurityConfig(cfg, command, secContext)
-	}
-	if err := installAuthz(srv, az, sec, levelConfig); err != nil {
+	if err := installAuthz(d, srv, az); err != nil {
 		t.Fatal(err)
 	}
+	d.RegisterDefaultCommands(srv)
 	registerQueueCommands(srv, as.q, as.log, t.TempDir())
 	negotiate.New(as.q, as.log, nil).Register(srv)
 	spool.New(spool.Options{Queue: as.q, SpoolDir: t.TempDir()}).Register(srv)
@@ -698,8 +701,12 @@ func TestCommandLevelsMatchCxx(t *testing.T) {
 		{match.ALIVE, "READ", false},
 		{commands.FILETRANS_UPLOAD, "WRITE", false},
 		{commands.FILETRANS_DOWNLOAD, "WRITE", false},
+		{commands.DC_NOP_CONFIG, "CONFIG", false},
+		{commands.DC_NOP_ADVERTISE_SCHEDD, "ADVERTISE_SCHEDD", false},
+		{commands.DC_NOP_ADVERTISE_STARTD, "ADVERTISE_STARTD", false},
+		{commands.DC_NOP_ADVERTISE_MASTER, "ADVERTISE_MASTER", false},
 	} {
-		name := commands.GetCommandName(tc.cmd)
+		name := commandName(tc.cmd)
 		perms := srv.CommandPerms(tc.cmd)
 		if len(perms) != 1 || perms[0] != tc.level {
 			t.Errorf("%s registered at %v, want [%s]", name, perms, tc.level)
@@ -712,7 +719,68 @@ func TestCommandLevelsMatchCxx(t *testing.T) {
 		if forced := got.Authentication == security.SecurityRequired; forced != tc.forceAuth {
 			t.Errorf("%s negotiated with authentication required = %v, want %v", name, forced, tc.forceAuth)
 		}
+		if got.RemoteVersion != version {
+			t.Errorf("%s policy advertises version %q, want %q", name, got.RemoteVersion, version)
+		}
 	}
+}
+
+// TestCommandsNegotiateAtTheirLevel runs handshakes against the schedd as
+// run() builds it: each command negotiates under the SEC_<level>_* policy of
+// the level it is registered at, an ADVERTISE_* level falling back to
+// SEC_DAEMON_* while its own is unset and following SEC_ADVERTISE_<x>_* once
+// a reconfig sets it, a CONFIG command under SEC_DEFAULT_* rather than
+// SEC_DAEMON_*, and a forceAuthCommands command requires authentication
+// whatever its level's policy says. Every ALLOW_<level> admits anyone, so a
+// refused handshake is the security policy's doing, not authorization's.
+func TestCommandsNegotiateAtTheirLevel(t *testing.T) {
+	knobs := map[string]string{"SEC_DAEMON_AUTHENTICATION": "REQUIRED"}
+	for _, lvl := range []string{"READ", "WRITE", "NEGOTIATOR", "ADMINISTRATOR", "CONFIG", "DAEMON",
+		"ADVERTISE_SCHEDD", "ADVERTISE_STARTD", "ADVERTISE_MASTER"} {
+		knobs["ALLOW_"+lvl] = "*"
+	}
+	as := startAuthzSchedd(t, knobs)
+
+	expect := func(phase string, cmd int, wantAnonymous bool) {
+		t.Helper()
+		name := commandName(cmd)
+		_, _, err := as.dial(t, as.as(t, ""), cmd)
+		var denied *security.AuthorizationError
+		if errors.As(err, &denied) {
+			t.Errorf("%s: anonymous %s refused by authorization (%v), want only the security policy to decide", phase, name, err)
+		} else if accepted := err == nil; accepted != wantAnonymous {
+			t.Errorf("%s: anonymous %s negotiated = %v (err %v), want %v", phase, name, accepted, err, wantAnonymous)
+		}
+		if _, _, err := as.dial(t, as.token(t, "alice@pool"), cmd); err != nil {
+			t.Errorf("%s: authenticated %s refused: %v", phase, name, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		cmd           int
+		wantAnonymous bool
+	}{
+		{commands.DC_NOP_READ, true},
+		{commands.DC_NOP_WRITE, true},
+		{commands.DC_NOP_CONFIG, true},
+		{commands.DC_NOP_DAEMON, false},
+		{commands.DC_NOP_ADVERTISE_SCHEDD, false},
+		{commands.DC_NOP_ADVERTISE_STARTD, false},
+		{commands.DC_NOP_ADVERTISE_MASTER, false},
+		{commands.QUERY_JOB_ADS, true},
+		{commands.QUERY_JOB_ADS_WITH_AUTH, false},
+		{commands.QMGMT_WRITE_CMD, false},
+		{commands.ACT_ON_JOBS, false},
+	} {
+		expect("SEC_ADVERTISE_SCHEDD_AUTHENTICATION unset", tc.cmd, tc.wantAnonymous)
+	}
+
+	knobs["SEC_ADVERTISE_SCHEDD_AUTHENTICATION"] = "OPTIONAL"
+	as.writeConfig(t, knobs)
+	as.reconfig(t, as.token(t, "alice@pool"))
+	expect("SEC_ADVERTISE_SCHEDD_AUTHENTICATION=OPTIONAL", commands.DC_NOP_ADVERTISE_SCHEDD, true)
+	expect("SEC_ADVERTISE_SCHEDD_AUTHENTICATION=OPTIONAL", commands.DC_NOP_ADVERTISE_STARTD, false)
+	expect("SEC_ADVERTISE_SCHEDD_AUTHENTICATION=OPTIONAL", commands.DC_NOP_DAEMON, false)
 }
 
 // TestLogDenialIgnoresOtherErrors: only authorization refusals are logged as
@@ -730,6 +798,12 @@ func TestLogDenialIgnoresOtherErrors(t *testing.T) {
 	if len(records) != 0 {
 		t.Errorf("logged %d records for a security-level refusal, want 0", len(records))
 	}
+}
+
+// commandName names cmd in a failure message, by number where cedar's
+// command table has no name for it (the DC_NOP_* levels).
+func commandName(cmd int) string {
+	return fmt.Sprintf("%s (%d)", commands.GetCommandName(cmd), cmd)
 }
 
 func mustParse(t *testing.T, s string) *classad.ClassAd {

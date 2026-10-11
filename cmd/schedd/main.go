@@ -129,7 +129,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
-	if err := installAuthz(srv, az, sec, d.ServerSecurityConfig); err != nil {
+	if err := installAuthz(d, srv, az); err != nil {
 		return fmt.Errorf("building per-level security config: %w", err)
 	}
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon, and
