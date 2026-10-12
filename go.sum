@@ -44,8 +44,8 @@ github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751/go.mod h1:LOuy
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190717042225-c3de453c63f4/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d/go.mod h1:rBZYJk541a8SKzHPHnH3zbiI+7dagKZ0cgpgrD7Fyho=
-github.com/bbockelm/cedar v0.7.8 h1:bjwwA2HMdDgbE+J/3CmDSK316/TC/JHzxRWh7T9KYhk=
-github.com/bbockelm/cedar v0.7.8/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
+github.com/bbockelm/cedar v0.7.9 h1:pUlv1ehlyNyDq5xw+XJ1xTgNBBAIH/vx2z2U+ddBmx0=
+github.com/bbockelm/cedar v0.7.9/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bbockelm/golang-htcondor v0.20.2 h1:Ey9BqjLB2v0vlbJbIbTXWPFgLHUEiaBYwz+TlvOAlIc=
 github.com/bbockelm/golang-htcondor v0.20.2/go.mod h1:o4AbJODAeVZMLuLTAdcidPzxWf1M+bBxjVNGESMSLWk=
 github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=
