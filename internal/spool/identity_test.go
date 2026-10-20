@@ -66,7 +66,9 @@ func spoolFor(t *testing.T, q *queue.Queue, neg *security.SecurityNegotiation, c
 		t.Fatalf("finish ids: %v", err)
 	}
 	_ = s.Close() // no sandbox follows; the handler fails either way
-	<-done
+	if err := <-done; err != nil {
+		t.Logf("handler: %v", err) // not under test here
+	}
 	ad, ok := q.Get(c, 0)
 	if !ok {
 		t.Fatalf("job %d.0 missing", c)
@@ -94,7 +96,9 @@ func transferCount(t *testing.T, q *queue.Queue, neg *security.SecurityNegotiati
 		t.Fatalf("read job count: %v", err)
 	}
 	_ = s.Close()
-	<-done
+	if err := <-done; err != nil {
+		t.Logf("handler: %v", err) // not under test here
+	}
 	return n
 }
 
