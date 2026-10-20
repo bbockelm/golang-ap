@@ -792,6 +792,31 @@ func TestCommandsNegotiateAtTheirLevel(t *testing.T) {
 	expect("SEC_ADVERTISE_SCHEDD_AUTHENTICATION=OPTIONAL", commands.DC_NOP_DAEMON, false)
 }
 
+// TestResumedSessionAdvertisesVersion: a connection that resumes a cached
+// session with the schedd sees the schedd's detected CondorVersion in the
+// resume reply, as the connection that negotiated the session did, not
+// cedar's built-in default. A C++ peer gates wire features on the version.
+func TestResumedSessionAdvertisesVersion(t *testing.T) {
+	as := startAuthzSchedd(t, map[string]string{"ALLOW_READ": "*", "ALLOW_WRITE": "*"})
+	for _, cmd := range []int{commands.QUERY_JOB_ADS, commands.ACT_ON_JOBS} {
+		name := commandName(cmd)
+		sec := as.token(t, "alice@pool")
+		for _, resume := range []bool{false, true} {
+			cl, _, err := as.dial(t, sec, cmd)
+			if err != nil {
+				t.Fatalf("%s (resume=%v): %v", name, resume, err)
+			}
+			neg := cl.GetSecurityNegotiation()
+			if neg.SessionResumed != resume {
+				t.Fatalf("%s: session resumed = %v, want %v", name, neg.SessionResumed, resume)
+			}
+			if v := neg.ServerConfig.RemoteVersion; v != as.version {
+				t.Errorf("%s (resume=%v): schedd advertised version %q, want %q", name, resume, v, as.version)
+			}
+		}
+	}
+}
+
 // TestLogDenialIgnoresOtherErrors: only authorization refusals are logged as
 // PERMISSION DENIED.
 func TestLogDenialIgnoresOtherErrors(t *testing.T) {
