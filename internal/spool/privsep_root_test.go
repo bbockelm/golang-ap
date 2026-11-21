@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/golang-htcondor/droppriv"
+	"github.com/htcondor/golang-htcondor/droppriv"
 )
 
 // TestRootGatedSpoolOwnership proves that when the schedd runs privileged, the

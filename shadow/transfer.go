@@ -53,8 +53,8 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/golang-htcondor/droppriv"
-	"github.com/bbockelm/golang-htcondor/filetransfer"
+	"github.com/htcondor/golang-htcondor/droppriv"
+	"github.com/htcondor/golang-htcondor/filetransfer"
 
 	"github.com/bbockelm/golang-ap/internal/identity"
 )

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestStage1ScheddUnderCondorMaster runs the pure-Go schedd as the SCHEDD daemon

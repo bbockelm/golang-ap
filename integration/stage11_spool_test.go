@@ -31,7 +31,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestStage11Spool exercises sandbox spooling end to end against the pure-Go

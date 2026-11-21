@@ -38,8 +38,8 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/bbockelm/cedar/stream"
-	"github.com/bbockelm/golang-htcondor/droppriv"
-	"github.com/bbockelm/golang-htcondor/startd"
+	"github.com/htcondor/golang-htcondor/droppriv"
+	"github.com/htcondor/golang-htcondor/startd"
 )
 
 // ErrDetached is returned by Run/RunReconnect when the shadow was told to detach

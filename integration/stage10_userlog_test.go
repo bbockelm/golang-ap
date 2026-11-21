@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	htcondor "github.com/bbockelm/golang-htcondor"
-	"github.com/bbockelm/golang-htcondor/userlog"
+	htcondor "github.com/htcondor/golang-htcondor"
+	"github.com/htcondor/golang-htcondor/userlog"
 )
 
 // TestStage10UserLog exercises the standard user-job-log (`log = ...` in the

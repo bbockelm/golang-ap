@@ -4,8 +4,8 @@ import (
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/golang-htcondor/authz"
-	"github.com/bbockelm/golang-htcondor/daemon"
+	"github.com/htcondor/golang-htcondor/authz"
+	"github.com/htcondor/golang-htcondor/daemon"
 )
 
 // authzOptions is the schedd's ALLOW_<level>/DENY_<level> authorization for

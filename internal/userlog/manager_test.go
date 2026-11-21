@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	hlog "github.com/bbockelm/golang-htcondor/userlog"
+	hlog "github.com/htcondor/golang-htcondor/userlog"
 )
 
 // fakeWriter records the events written to one path and can optionally block
