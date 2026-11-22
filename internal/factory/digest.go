@@ -20,7 +20,7 @@
 // statement. Everything else (Cmd, Iwd, RequestCpus, Requirements, JobUniverse,
 // Owner, ...) is on the cluster ad, sent by condor_submit before SetJobFactory.
 //
-// The macro expansion reuses github.com/bbockelm/golang-htcondor/config (the same
+// The macro expansion reuses github.com/htcondor/golang-htcondor/config (the same
 // submit/config macro engine condor_submit-in-Go uses): the digest assignments
 // are loaded as config values and $(...) is expanded against per-row live
 // variables set with HTCondor's exact foreach semantics (verified against stock
@@ -34,7 +34,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/config"
 )
 
 // assign is one digest assignment line (raw, unexpanded value).

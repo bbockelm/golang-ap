@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/htcondor/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/queue"
 	"github.com/bbockelm/golang-ap/internal/stats"

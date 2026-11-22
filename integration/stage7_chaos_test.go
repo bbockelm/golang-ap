@@ -27,7 +27,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // Stage 7 chaos tests: the Go schedd must survive everything a shadow, starter,

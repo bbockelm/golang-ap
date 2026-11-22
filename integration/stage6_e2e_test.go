@@ -25,7 +25,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestStage6EndToEnd is the marquee stage-6 test: the full pipeline with the

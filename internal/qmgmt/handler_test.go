@@ -8,7 +8,7 @@ import (
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
 	"github.com/bbockelm/cedar/stream"
-	hqmgmt "github.com/bbockelm/golang-htcondor/qmgmt"
+	hqmgmt "github.com/htcondor/golang-htcondor/qmgmt"
 
 	"github.com/bbockelm/golang-ap/internal/conntest"
 	"github.com/bbockelm/golang-ap/internal/queue"

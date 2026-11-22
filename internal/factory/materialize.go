@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/config"
 )
 
 // ItemSeparator is the field separator condor_submit uses inside an itemdata row

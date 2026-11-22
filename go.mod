@@ -3,12 +3,12 @@ module github.com/bbockelm/golang-ap
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.38.2
-	github.com/PelicanPlatform/classad/collections v0.38.2
-	github.com/bbockelm/cedar v0.7.14
-	github.com/bbockelm/golang-htcondor v0.22.1
+	github.com/PelicanPlatform/classad v0.38.3
+	github.com/PelicanPlatform/classad/collections v0.38.3
+	github.com/bbockelm/cedar v0.7.15
+	github.com/htcondor/golang-htcondor v0.25.0
 	github.com/prometheus/client_golang v1.25.0
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 )
 
 require (
@@ -43,9 +43,9 @@ require (
 	github.com/sethvargo/go-retry v0.4.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	modernc.org/libc v1.74.3 // indirect

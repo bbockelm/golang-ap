@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	htcondor "github.com/bbockelm/golang-htcondor"
-	"github.com/bbockelm/golang-htcondor/userlog"
+	htcondor "github.com/htcondor/golang-htcondor"
+	"github.com/htcondor/golang-htcondor/userlog"
 )
 
 // TestStage12UserLogBackpressure is the isolation proof for ROADMAP #1 steps

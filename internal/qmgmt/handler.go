@@ -6,7 +6,7 @@
 //
 // Framing verified against src/condor_schedd.V6/qmgmt_receivers.cpp (do_Q_request)
 // and qmgmt_send_stubs.cpp (the client stubs). Op set and reply conventions live
-// in the shared codec package github.com/bbockelm/golang-htcondor/qmgmt.
+// in the shared codec package github.com/htcondor/golang-htcondor/qmgmt.
 package qmgmt
 
 import (
@@ -21,8 +21,8 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/bbockelm/cedar/message"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/golang-htcondor/logging"
-	hqmgmt "github.com/bbockelm/golang-htcondor/qmgmt"
+	"github.com/htcondor/golang-htcondor/logging"
+	hqmgmt "github.com/htcondor/golang-htcondor/qmgmt"
 
 	"github.com/bbockelm/golang-ap/internal/factory"
 	"github.com/bbockelm/golang-ap/internal/identity"

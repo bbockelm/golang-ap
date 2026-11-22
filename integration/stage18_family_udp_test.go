@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestStage18NegotiateAfterUDPFamilyResume runs a job through the pure-Go

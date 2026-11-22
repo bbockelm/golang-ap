@@ -33,7 +33,7 @@ func TestCollectorCounters(t *testing.T) {
 	c.IncMatchesReceived()
 	c.IncNegotiationCycles()
 	c.AddJobsMaterialized(4)
-	c.AddJobsMaterialized(0) // ignored
+	c.AddJobsMaterialized(0)  // ignored
 	c.AddJobsMaterialized(-3) // ignored
 
 	s := c.Snapshot()

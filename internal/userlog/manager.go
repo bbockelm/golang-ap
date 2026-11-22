@@ -2,7 +2,7 @@
 // user-job-log events (the file a submit description names with `log =
 // ...`) so condor_wait and DAGMan can follow a job's lifecycle.
 //
-// It is a thin adapter over github.com/bbockelm/golang-htcondor/userlog
+// It is a thin adapter over github.com/htcondor/golang-htcondor/userlog
 // (the byte-compatible classic-format Writer): the Manager resolves a
 // job's log path from its ClassAd (the UserLog attribute, honoring
 // absolute vs Iwd-relative paths, matching getPathToUserLog in
@@ -70,7 +70,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	hlog "github.com/bbockelm/golang-htcondor/userlog"
+	hlog "github.com/htcondor/golang-htcondor/userlog"
 )
 
 // Config tunes the async writer pool. Zero values get sensible defaults

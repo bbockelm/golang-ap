@@ -25,7 +25,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // stage13 exercises HTCondor job policy (ROADMAP #2): periodic + on-exit
