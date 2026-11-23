@@ -22,7 +22,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/security"
 )
 
 // JobStatus values (HTCondor's JobStatus attribute).

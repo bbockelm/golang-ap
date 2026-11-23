@@ -22,7 +22,7 @@ import (
 	"os"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/message"
+	"github.com/htcondor/cedar/message"
 )
 
 // Remote syscall numbers, verified against
