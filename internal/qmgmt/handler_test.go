@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/security"
+	"github.com/htcondor/cedar/stream"
 	hqmgmt "github.com/htcondor/golang-htcondor/qmgmt"
 
 	"github.com/bbockelm/golang-ap/internal/conntest"

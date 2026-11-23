@@ -21,8 +21,8 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/bbockelm/cedar/message"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/message"
+	cedarserver "github.com/htcondor/cedar/server"
 	"github.com/htcondor/golang-htcondor/logging"
 
 	"github.com/bbockelm/golang-ap/internal/identity"

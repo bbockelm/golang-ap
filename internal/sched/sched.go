@@ -44,7 +44,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/security"
 	"github.com/htcondor/golang-htcondor/droppriv"
 	"github.com/htcondor/golang-htcondor/logging"
 	"github.com/htcondor/golang-htcondor/startd"

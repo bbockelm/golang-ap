@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/stream"
 )
 
 // fakeStarter drives one side of a loopback syscall stream with the exact

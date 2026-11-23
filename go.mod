@@ -3,10 +3,10 @@ module github.com/bbockelm/golang-ap
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.38.3
-	github.com/PelicanPlatform/classad/collections v0.38.3
-	github.com/bbockelm/cedar v0.7.15
-	github.com/htcondor/golang-htcondor v0.25.0
+	github.com/PelicanPlatform/classad v0.44.1
+	github.com/PelicanPlatform/classad/collections v0.44.1
+	github.com/htcondor/cedar v0.7.17
+	github.com/htcondor/golang-htcondor v0.26.1
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/crypto v0.59.0
 )
@@ -26,6 +26,7 @@ require (
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
 	github.com/jcmturner/gofork v1.7.6 // indirect
+	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect

@@ -27,8 +27,8 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/security"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/security"
+	cedarserver "github.com/htcondor/cedar/server"
 	htcondor "github.com/htcondor/golang-htcondor"
 	"github.com/htcondor/golang-htcondor/startd"
 

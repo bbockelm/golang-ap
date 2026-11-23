@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bbockelm/cedar/commands"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/commands"
+	cedarserver "github.com/htcondor/cedar/server"
 	"github.com/htcondor/golang-htcondor/config"
 	"github.com/htcondor/golang-htcondor/logging"
 

@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/client"
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/security"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/client"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/security"
+	cedarserver "github.com/htcondor/cedar/server"
 )
 
 const (

@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/message"
-	"github.com/bbockelm/cedar/security"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/message"
+	"github.com/htcondor/cedar/security"
 
 	"github.com/bbockelm/golang-ap/internal/conntest"
 	"github.com/bbockelm/golang-ap/internal/identity"
